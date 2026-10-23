@@ -1,0 +1,54 @@
+name: K-line snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      all_a_shares:
+        description: '拉取全体 A 股日线/周线（首次初始化请勾选）'
+        required: false
+        default: true
+        type: boolean
+      all_m30:
+        description: '按批次拉取全体 A 股 30 分钟线（手动运行）'
+        required: false
+        default: false
+        type: boolean
+      batch_index:
+        description: '30 分钟批次编号，从 0 开始'
+        required: false
+        default: '0'
+        type: string
+      batch_size:
+        description: '每批股票数，建议 50-100'
+        required: false
+        default: '100'
+        type: string
+  schedule:
+    # 工作日北京时间 17:30（UTC 09:30）
+    - cron: '30 9 * * 1-5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kline-snapshot
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and publish snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ inputs.all_m30 }}" = "true" ]; then
+            python3 scripts/kline_snapshot.py --all-a-shares --all-m30 \
+              --batch-index "${{ inputs.batch_index }}" --batch-size "${{ inputs.batch_size }}" \
+              --skip-daily-weekly --workers 2 --delay 0.8 --keep 7
+          else
+            python3 scripts/kline_snapshot.py --all-a-shares --workers 2 --delay 0.8 --keep 7
+          fi
