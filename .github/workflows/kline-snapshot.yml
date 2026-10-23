@@ -48,7 +48,7 @@ jobs:
           if [ "${{ inputs.all_m30 }}" = "true" ]; then
             python3 scripts/kline_snapshot.py --all-a-shares --all-m30 \
               --batch-index "${{ inputs.batch_index }}" --batch-size "${{ inputs.batch_size }}" \
-              --skip-daily-weekly --workers 2 --delay 0.8 --keep 7
+              --skip-daily-weekly --workers 4 --delay 0.35 --keep 7
           else
             python3 scripts/kline_snapshot.py --all-a-shares --workers 2 --delay 0.8 --keep 7
           fi
