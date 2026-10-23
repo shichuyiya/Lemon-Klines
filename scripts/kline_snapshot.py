@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Build and publish Lemon Light K-line snapshots from Eastmoney.
+"""Build and publish Lemon Light K-line snapshots (Tencent data source).
 
-The script intentionally uses only Python's standard library so it can run in
-GitHub Actions without installing a data SDK.  Daily/weekly history is pulled
-for the A-share universe; 30-minute history is pulled only for symbols listed
-in scripts/symbols.txt by default. ``--all-m30`` enables resumable batches for
-the whole A-share universe.
+History: the original script pulled daily/weekly klines from Eastmoney.  Eastmoney
+progressively blocked GitHub Actions runner IP ranges (clist pages first, then
+stock/kline endpoints -- curl exit 52 empty replies), so three consecutive runs
+failed or hit the 6-hour job timeout.  This version switches to Tencent's
+web.ifzq.gtimg.cn kline API (same family as the app's own quote service, tolerant
+of datacenter IPs) and reads the symbol universe from scripts/universe.json
+generated locally, so Actions never requests a listing endpoint at all.
+
+Weekly bars are derived locally from daily bars (identical semantics, halves the
+request count).  A 5.5h deadline guard guarantees the snapshot is always packed
+and published even under extreme latency.
 """
 from __future__ import annotations
 
@@ -29,51 +35,47 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / ".kline-cache"
+UNIVERSE_FILE = ROOT / "scripts" / "universe.json"
 SYMBOLS_FILE = ROOT / "scripts" / "symbols.txt"
-UA = "Lemon-Light-kline-backfill/1.0"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Lemon-Light-kline-backfill/1.1"
 PERIODS = {"day": (101, 1023), "week": (102, 260), "m30": (30, 320)}
-REQUEST_DELAY = 0.5
-REQUEST_TIMEOUT = 90
-REQUEST_RETRIES = 8
-MARKET_HOSTS = {
-    "push2.eastmoney.com": ("push2.eastmoney.com", "80.push2.eastmoney.com", "82.push2.eastmoney.com", "81.push2.eastmoney.com"),
-    "push2his.eastmoney.com": ("push2his.eastmoney.com", "80.push2his.eastmoney.com", "82.push2his.eastmoney.com", "81.push2his.eastmoney.com"),
-}
+REQUEST_DELAY = 0.35
+REQUEST_TIMEOUT = 60
+REQUEST_RETRIES = 5
+QQ_HOSTS = ("web.ifzq.gtimg.cn", "ifzq.gtimg.cn")
 SNAPSHOT_MAGIC = b"LKSNAP1"
 SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|m30|m60|m15|m5)\.json\.gz$|^_universe\.json$")
 
 
 def http_json(url: str, retries: int = REQUEST_RETRIES) -> dict:
-    """Fetch a market endpoint with backoff for transient gateway/rate-limit errors."""
+    """Fetch a Tencent market endpoint with host rotation + backoff."""
     last: Exception | None = None
     parsed = urllib.parse.urlsplit(url)
-    hosts = MARKET_HOSTS.get(parsed.hostname or "", (parsed.hostname or "",))
     for attempt in range(retries):
-        host = hosts[attempt % len(hosts)]
+        host = QQ_HOSTS[attempt % len(QQ_HOSTS)]
         request_url = urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
         try:
-            # GitHub's Ubuntu runners occasionally stall during Python/OpenSSL's
-            # handshake with Eastmoney, while the system curl path is reliable.
             curl = subprocess.run([
                 "curl", "--ipv4", "--fail-with-body", "--silent", "--show-error", "--location",
-                "--retry", "2", "--retry-all-errors", "--retry-delay", "2",
-                "--connect-timeout", "20", "--max-time", str(REQUEST_TIMEOUT),
-                "-A", UA, "-e", "https://quote.eastmoney.com/", request_url,
+                "--connect-timeout", "15", "--max-time", str(REQUEST_TIMEOUT),
+                "-A", UA, "-e", "https://gu.qq.com/", request_url,
             ], capture_output=True, text=True, check=True)
-            return json.loads(curl.stdout)
+            text = curl.stdout
+            # ifzq.gtimg.cn 裸域会带 JSONP 前缀（var xxx=...;），web. 域返回纯 JSON。
+            text = re.sub(r"^[^=]+=", "", text, count=1).rstrip().rstrip(";")
+            return json.loads(text)
         except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
             last = exc
             if isinstance(exc, FileNotFoundError):
-                # Keep local/non-Linux environments working if curl is absent.
                 try:
-                    req = urllib.request.Request(request_url, headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
+                    req = urllib.request.Request(request_url, headers={"User-Agent": UA, "Referer": "https://gu.qq.com/"})
                     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as res:
                         return json.loads(res.read().decode("utf-8"))
                 except (TimeoutError, urllib.error.URLError, json.JSONDecodeError) as fallback_exc:
                     last = fallback_exc
         if attempt + 1 < retries:
-            time.sleep(min(60, 2 ** attempt) + random.random())
-    raise RuntimeError(f"market request failed after {retries} retries: {last}")
+            time.sleep(min(30, 2 ** attempt) + random.random())
+    raise RuntimeError(f"tencent request failed after {retries} retries: {last}")
 
 
 def symbols_from_file() -> list[str]:
@@ -87,36 +89,14 @@ def symbols_from_file() -> list[str]:
     return sorted(set(out))
 
 
-def all_a_shares() -> list[str]:
-    """拉全市场 A 股代码列表。Actions 的出口 IP 对东财 clist 网关单页偶发被拒（curl exit 52 空响应），
-    且同一备用 host 上重试往往继续被拒——单页失败改为跳过继续（缺口下一轮运行自然补上，
-    铺底数据不需要一次拿全），仅当总收获过少（<3000，说明网关大面积拒绝）才报错。"""
-    out: list[str] = []
-    failures = 0
-    # pz=100 is materially more stable than 200 on Eastmoney's gateway.
-    for page in range(1, 90):
-        q = urllib.parse.urlencode({"pn": page, "pz": 100, "po": 0, "np": 1, "fltt": 2, "invt": 2,
-                                    "fid": "f12", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
-                                    "fields": "f12,f13"})
-        try:
-            data = http_json(f"https://push2.eastmoney.com/api/qt/clist/get?{q}").get("data") or {}
-        except Exception as exc:
-            failures += 1
-            if failures > 8:
-                raise
-            print(f"clist page {page} failed ({exc}); skip", flush=True)
-            continue
-        rows = data.get("diff") or {}
-        if isinstance(rows, dict): rows = list(rows.values())
-        if not rows: break
-        for row in rows:
-            code, market = str(row.get("f12", "")), int(row.get("f13", -1))
-            if re.fullmatch(r"\d{6}", code):
-                out.append(("sh" if market == 1 else "sz" if market == 0 else "bj") + code)
-        if data.get("total") and len(out) + failures * 100 >= int(data["total"]): break
-    if len(out) < 3000:
-        raise RuntimeError(f"universe too small ({len(out)}); eastmoney gateway likely blocking")
-    return sorted(set(out))
+def universe_from_file() -> list[str]:
+    """读取本地生成的 scripts/universe.json（家宽生成后提交，Actions 不再请求列表接口）。"""
+    try:
+        data = json.loads(UNIVERSE_FILE.read_text(encoding="utf-8"))
+        values = data.get("symbols") if isinstance(data, dict) else data
+        return sorted({s for s in values if isinstance(s, str) and re.fullmatch(r"(?:sh|sz|bj)\d{6}", s)})
+    except (OSError, ValueError, TypeError):
+        return []
 
 
 def save_universe(symbols: list[str]) -> None:
@@ -124,34 +104,38 @@ def save_universe(symbols: list[str]) -> None:
     (CACHE / "_universe.json").write_text(json.dumps(symbols, separators=(",", ":")), encoding="utf-8")
 
 
-def cached_universe() -> list[str]:
-    path = CACHE / "_universe.json"
-    try:
-        values = json.loads(path.read_text(encoding="utf-8"))
-        return sorted({s for s in values if isinstance(s, str) and re.fullmatch(r"(?:sh|sz|bj)\d{6}", s)})
-    except (OSError, ValueError, TypeError):
-        return []
-
-
 def fetch(symbol: str, period: str, limit: int) -> list[dict]:
-    # Eastmoney 对大量并发请求较敏感；即使线程池只有少量 worker，
-    # 也在每个请求前留出间隔，避免首批任务形成瞬时洪峰。
-    time.sleep(max(0.0, REQUEST_DELAY) + random.random() * 0.25)
-    klt = PERIODS[period][0]
+    time.sleep(max(0.0, REQUEST_DELAY) + random.random() * 0.2)
     market, code = symbol[:2], symbol[2:]
-    secid = ("1." if market == "sh" else "0.") + code
-    q = urllib.parse.urlencode({"secid": secid, "klt": klt, "fqt": 1, "lmt": limit,
-                                "end": "20500101", "fields1": "f1,f2,f3,f4,f5,f6",
-                                "fields2": "f51,f52,f53,f54,f55,f56,f57"})
-    rows = (http_json(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{q}").get("data") or {}).get("klines") or []
+    if period == "m30":
+        url = (f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?"
+               f"param={symbol},m30,,{limit}")
+    else:
+        kind = "day" if period == "day" else "week"
+        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+               f"param={symbol},{kind},,,{limit},qfq")
+    data = http_json(url).get("data") or {}
+    node = data.get(symbol) or {}
+    if period == "m30":
+        rows = node.get("m30") or []
+        out = []
+        for p in rows:
+            if len(p) < 6: continue
+            try:
+                out.append({"date": f"{p[0][:4]}-{p[0][4:6]}-{p[0][6:8]} {p[0][8:10]}:{p[0][10:12]}",
+                            "open": float(p[1]), "close": float(p[2]), "high": float(p[3]),
+                            "low": float(p[4]), "volume": float(p[5]), "amount": 0.0})
+            except (ValueError, IndexError):
+                continue
+        return out
+    rows = node.get(f"qfq{period if period != 'day' else 'day'}") or node.get(period) or []
     out = []
-    for line in rows:
-        p = line.split(",")
+    for p in rows:
         if len(p) < 6: continue
         try:
             out.append({"date": p[0], "open": float(p[1]), "close": float(p[2]), "high": float(p[3]),
                         "low": float(p[4]), "volume": float(p[5]), "amount": float(p[6]) if len(p) > 6 else 0})
-        except ValueError:
+        except (ValueError, IndexError):
             continue
     return out
 
@@ -163,12 +147,7 @@ def save_cache(symbol: str, period: str, bars: list[dict]) -> None:
 
 
 def derive_week_bars(day_bars: list[dict]) -> list[dict]:
-    """由日线聚合周线（同东财口径：周内最后交易日为日期、首日开、末日收、极值高低、量额求和）。
-
-    东财周线单独请求会让全市场任务请求量翻倍（5400 只 × 2 周期 ≈ 10800 个请求，
-    runner 上单请求约 4 秒、2 worker —— 首次全量运行因此撞上 Actions 单 job 6 小时
-    硬上限被 cancelled）。前复权口径下日线聚合结果与周线接口一致，本地聚合即可。
-    """
+    """由日线聚合周线（同东财/腾讯口径：周内最后交易日为日期、首日开、末日收、极值高低、量额求和）。"""
     grouped: dict[tuple[int, int], list[dict]] = {}
     for b in day_bars:
         y, m, d = b["date"].split("-")
@@ -294,13 +273,13 @@ def publish(snapshot: Path, repo: str, token: str, keep: int) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--all-a-shares", action="store_true")
+    ap.add_argument("--all-a-shares", action="store_true", help="使用 scripts/universe.json 全量（默认）")
     ap.add_argument("--all-m30", action="store_true", help="将全体 A 股 30 分钟数据按批次拉取")
     ap.add_argument("--batch-index", type=int, default=0, help="30 分钟批次编号，从 0 开始")
     ap.add_argument("--batch-size", type=int, default=100, help="每个 30 分钟批次的股票数")
     ap.add_argument("--skip-daily-weekly", action="store_true", help="批量补分钟线时跳过日线/周线")
-    ap.add_argument("--workers", type=int, default=2)
-    ap.add_argument("--delay", type=float, default=0.5, help="每个行情请求前的秒数间隔")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--delay", type=float, default=0.35, help="每个行情请求前的秒数间隔")
     ap.add_argument("--keep", type=int, default=7)
     args = ap.parse_args()
     global REQUEST_DELAY
@@ -311,21 +290,15 @@ def main() -> int:
     if token and repo: restore_latest_snapshot(repo, token)
     watched = symbols_from_file()
     if args.all_a_shares or args.all_m30:
-        try:
-            universe = all_a_shares()
-            save_universe(universe)
-        except Exception as exc:
-            universe = cached_universe()
-            if universe:
-                print(f"universe discovery failed; using cached universe ({len(universe)}): {exc}", flush=True)
-            else:
-                raise
+        universe = universe_from_file()
+        if not universe:
+            raise RuntimeError("scripts/universe.json 缺失或为空——本地运行 .verify/pull-universe.cjs 生成后提交")
+        save_universe(universe)
     else:
         universe = watched
     if not universe: raise RuntimeError("no symbols; add symbols to scripts/symbols.txt or use --all-a-shares")
-    # 周线不单独请求：由日线按自然周聚合（derive_week_bars），请求量减半，
-    # 避免首次全量运行（5400 只 × 2 周期 ≈ 10800 请求）撞上 Actions 6 小时硬上限。
-    jobs = [(s, "day", PERIODS["day"][1]) for s in universe]
+    # 周线不单独请求：由日线按自然周聚合（derive_week_bars），请求量减半。
+    jobs = [] if args.skip_daily_weekly else [(s, "day", PERIODS["day"][1]) for s in universe]
     m30_symbols = universe if args.all_m30 else watched
     if args.all_m30:
         start = args.batch_index * args.batch_size
@@ -335,12 +308,10 @@ def main() -> int:
         print(f"m30 batch {args.batch_index}: {start}-{start + len(m30_symbols) - 1} / {len(universe)}", flush=True)
     jobs += [(s, "m30", PERIODS["m30"][1]) for s in m30_symbols]
     if not jobs: raise RuntimeError("没有待执行任务")
-    workers = max(1, min(args.workers, 2))
-    if args.workers != workers:
-        print(f"workers={args.workers} too high for Eastmoney; capped at {workers}", flush=True)
+    workers = max(1, min(args.workers, 4))
     # 死线守卫：Actions 单 job 6 小时硬上限，5.5 小时强制收尾——
     # 剩余任务直接放弃（缺口靠快照合并 + 下轮运行自然补齐），
-    # 保证无论如何都能走到打包发布那一步，不再整轮 cancelled 颗粒无收。
+    # 保证无论如何都能走到打包发布那一步。
     started = time.monotonic()
     deadline = started + 5.5 * 3600
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -369,8 +340,6 @@ def main() -> int:
             print(f"deadline reached; aborted {aborted}/{len(futures)} remaining requests (will catch up next run)", flush=True)
     if failures:
         print(f"completed with {len(failures)}/{len(jobs)} failed requests", file=sys.stderr)
-        # A few symbols can be unavailable/suspended; fail only when the data
-        # loss is material enough that publishing a snapshot would be unsafe.
         if len(failures) > max(20, len(jobs) // 20):
             raise RuntimeError("too many failed market requests; snapshot was not published")
     out = ROOT / "kline-snapshot.ksnap"
