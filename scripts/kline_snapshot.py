@@ -88,13 +88,24 @@ def symbols_from_file() -> list[str]:
 
 
 def all_a_shares() -> list[str]:
+    """拉全市场 A 股代码列表。Actions 的出口 IP 对东财 clist 网关单页偶发被拒（curl exit 52 空响应），
+    且同一备用 host 上重试往往继续被拒——单页失败改为跳过继续（缺口下一轮运行自然补上，
+    铺底数据不需要一次拿全），仅当总收获过少（<3000，说明网关大面积拒绝）才报错。"""
     out: list[str] = []
+    failures = 0
     # pz=100 is materially more stable than 200 on Eastmoney's gateway.
     for page in range(1, 90):
         q = urllib.parse.urlencode({"pn": page, "pz": 100, "po": 0, "np": 1, "fltt": 2, "invt": 2,
                                     "fid": "f12", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
                                     "fields": "f12,f13"})
-        data = http_json(f"https://push2.eastmoney.com/api/qt/clist/get?{q}").get("data") or {}
+        try:
+            data = http_json(f"https://push2.eastmoney.com/api/qt/clist/get?{q}").get("data") or {}
+        except Exception as exc:
+            failures += 1
+            if failures > 8:
+                raise
+            print(f"clist page {page} failed ({exc}); skip", flush=True)
+            continue
         rows = data.get("diff") or {}
         if isinstance(rows, dict): rows = list(rows.values())
         if not rows: break
@@ -102,7 +113,9 @@ def all_a_shares() -> list[str]:
             code, market = str(row.get("f12", "")), int(row.get("f13", -1))
             if re.fullmatch(r"\d{6}", code):
                 out.append(("sh" if market == 1 else "sz" if market == 0 else "bj") + code)
-        if data.get("total") and len(out) >= int(data["total"]): break
+        if data.get("total") and len(out) + failures * 100 >= int(data["total"]): break
+    if len(out) < 3000:
+        raise RuntimeError(f"universe too small ({len(out)}); eastmoney gateway likely blocking")
     return sorted(set(out))
 
 
