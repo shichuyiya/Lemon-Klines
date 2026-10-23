@@ -60,6 +60,9 @@ def http_json(url: str, retries: int = REQUEST_RETRIES) -> dict:
                 "--connect-timeout", "15", "--max-time", str(REQUEST_TIMEOUT),
                 "-A", UA, "-e", "https://gu.qq.com/", request_url,
             ], capture_output=True, text=True, check=True)
+            if not curl.stdout.strip():
+                # 限流期腾讯可能返回 200 但空 body（等价于东财 exit 52）——视为失败进入重试
+                raise RuntimeError("empty body")
             text = curl.stdout
             # ifzq.gtimg.cn 裸域会带 JSONP 前缀（var xxx=...;），web. 域返回纯 JSON。
             text = re.sub(r"^[^=]+=", "", text, count=1).rstrip().rstrip(";")
@@ -133,8 +136,15 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
     for p in rows:
         if len(p) < 6: continue
         try:
+            # 腾讯 qfq 接口在除权除息日的 K 线末尾会追加分红说明 dict（如
+            # {"nd":"2023","fh_sh":"1.4","cqr":"2024-06-19",...}），amount 位
+            # 可能是 dict 而非字符串——取值前先判断类型，只认纯数字字符串。
+            amount = 0.0
+            if len(p) > 6 and isinstance(p[6], (str, int, float)):
+                try: amount = float(p[6])
+                except ValueError: amount = 0.0
             out.append({"date": p[0], "open": float(p[1]), "close": float(p[2]), "high": float(p[3]),
-                        "low": float(p[4]), "volume": float(p[5]), "amount": float(p[6]) if len(p) > 6 else 0})
+                        "low": float(p[4]), "volume": float(p[5]), "amount": amount})
         except (ValueError, IndexError):
             continue
     return out
@@ -278,8 +288,8 @@ def main() -> int:
     ap.add_argument("--batch-index", type=int, default=0, help="30 分钟批次编号，从 0 开始")
     ap.add_argument("--batch-size", type=int, default=100, help="每个 30 分钟批次的股票数")
     ap.add_argument("--skip-daily-weekly", action="store_true", help="批量补分钟线时跳过日线/周线")
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--delay", type=float, default=0.35, help="每个行情请求前的秒数间隔")
+    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--delay", type=float, default=0.6, help="每个行情请求前的秒数间隔")
     ap.add_argument("--keep", type=int, default=7)
     args = ap.parse_args()
     global REQUEST_DELAY
@@ -340,7 +350,9 @@ def main() -> int:
             print(f"deadline reached; aborted {aborted}/{len(futures)} remaining requests (will catch up next run)", flush=True)
     if failures:
         print(f"completed with {len(failures)}/{len(jobs)} failed requests", file=sys.stderr)
-        if len(failures) > max(20, len(jobs) // 20):
+        # 失败容忍阈值放宽：限流期尾段损失一批属正常（缺口下轮自然补齐），
+        # 只有超过一半（说明数据源整体不可用）才拒绝发布。
+        if len(failures) > len(jobs) // 2:
             raise RuntimeError("too many failed market requests; snapshot was not published")
     out = ROOT / "kline-snapshot.ksnap"
     digest = pack_snapshot(out)
