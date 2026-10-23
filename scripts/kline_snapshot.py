@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +40,7 @@ MARKET_HOSTS = {
     "push2his.eastmoney.com": ("push2his.eastmoney.com", "80.push2his.eastmoney.com", "82.push2his.eastmoney.com", "81.push2his.eastmoney.com"),
 }
 SNAPSHOT_MAGIC = b"LKSNAP1"
-SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|m30|m60|m15)\.json\.gz$|^_universe\.json$")
+SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|m30|m60|m15|m5)\.json\.gz$|^_universe\.json$")
 
 
 def http_json(url: str, retries: int = REQUEST_RETRIES) -> dict:
@@ -160,6 +160,33 @@ def save_cache(symbol: str, period: str, bars: list[dict]) -> None:
     CACHE.mkdir(parents=True, exist_ok=True)
     payload = {"symbol": symbol, "tf": period, "bars": bars, "updatedAt": int(time.time() * 1000)}
     (CACHE / f"{symbol}.{period}.json.gz").write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode()))
+
+
+def derive_week_bars(day_bars: list[dict]) -> list[dict]:
+    """由日线聚合周线（同东财口径：周内最后交易日为日期、首日开、末日收、极值高低、量额求和）。
+
+    东财周线单独请求会让全市场任务请求量翻倍（5400 只 × 2 周期 ≈ 10800 个请求，
+    runner 上单请求约 4 秒、2 worker —— 首次全量运行因此撞上 Actions 单 job 6 小时
+    硬上限被 cancelled）。前复权口径下日线聚合结果与周线接口一致，本地聚合即可。
+    """
+    grouped: dict[tuple[int, int], list[dict]] = {}
+    for b in day_bars:
+        y, m, d = b["date"].split("-")
+        iso = date(int(y), int(m), int(d)).isocalendar()
+        grouped.setdefault((iso[0], iso[1]), []).append(b)
+    out: list[dict] = []
+    for key in sorted(grouped):
+        days = grouped[key]
+        out.append({
+            "date": days[-1]["date"],
+            "open": days[0]["open"],
+            "close": days[-1]["close"],
+            "high": max(x["high"] for x in days),
+            "low": min(x["low"] for x in days),
+            "volume": sum(x["volume"] for x in days),
+            "amount": sum(x.get("amount", 0.0) for x in days),
+        })
+    return out
 
 
 def pack_snapshot(out: Path) -> str:
@@ -296,7 +323,9 @@ def main() -> int:
     else:
         universe = watched
     if not universe: raise RuntimeError("no symbols; add symbols to scripts/symbols.txt or use --all-a-shares")
-    jobs = [] if args.skip_daily_weekly else [(s, p, PERIODS[p][1]) for s in universe for p in ("day", "week")]
+    # 周线不单独请求：由日线按自然周聚合（derive_week_bars），请求量减半，
+    # 避免首次全量运行（5400 只 × 2 周期 ≈ 10800 请求）撞上 Actions 6 小时硬上限。
+    jobs = [(s, "day", PERIODS["day"][1]) for s in universe]
     m30_symbols = universe if args.all_m30 else watched
     if args.all_m30:
         start = args.batch_index * args.batch_size
@@ -309,19 +338,35 @@ def main() -> int:
     workers = max(1, min(args.workers, 2))
     if args.workers != workers:
         print(f"workers={args.workers} too high for Eastmoney; capped at {workers}", flush=True)
+    # 死线守卫：Actions 单 job 6 小时硬上限，5.5 小时强制收尾——
+    # 剩余任务直接放弃（缺口靠快照合并 + 下轮运行自然补齐），
+    # 保证无论如何都能走到打包发布那一步，不再整轮 cancelled 颗粒无收。
+    started = time.monotonic()
+    deadline = started + 5.5 * 3600
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fetch, s, p, lim): (s, p) for s, p, lim in jobs}
         failures = []
+        aborted = 0
         for i, fut in enumerate(as_completed(futures), 1):
             s, p = futures[fut]
+            if time.monotonic() > deadline:
+                aborted = len(futures) - i + 1
+                break
             try:
                 bars = fut.result()
             except Exception as exc:
                 failures.append(f"{s} {p}: {exc}")
                 print(f"[{i}/{len(futures)}] FAILED {s} {p}: {exc}", flush=True)
                 continue
-            if bars: save_cache(s, p, bars)
+            if bars:
+                save_cache(s, p, bars)
+                if p == "day":
+                    save_cache(s, "week", derive_week_bars(bars))
             print(f"[{i}/{len(futures)}] {s} {p} {len(bars)}", flush=True)
+        if aborted:
+            for f in futures:
+                f.cancel()
+            print(f"deadline reached; aborted {aborted}/{len(futures)} remaining requests (will catch up next run)", flush=True)
     if failures:
         print(f"completed with {len(failures)}/{len(jobs)} failed requests", file=sys.stderr)
         # A few symbols can be unavailable/suspended; fail only when the data
