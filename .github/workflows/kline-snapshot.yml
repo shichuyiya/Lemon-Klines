@@ -23,6 +23,16 @@ on:
         required: false
         default: '100'
         type: string
+      rolling_m30:
+        description: '日常滚批补全市场 30 分钟线（自动任务用）'
+        required: false
+        default: false
+        type: boolean
+      rolling_batch_size:
+        description: '滚批每批股票数'
+        required: false
+        default: '500'
+        type: string
   schedule:
     # 工作日北京时间 17:30（UTC 09:30）
     - cron: '30 9 * * 1-5'
@@ -40,6 +50,11 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+      - name: Restore m30 rolling cursor
+        uses: actions/cache/restore@v4
+        with:
+          path: .m30-cursor
+          key: m30-cursor
       - name: Build and publish snapshot
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -48,9 +63,21 @@ jobs:
           if [ "${{ inputs.all_m30 }}" = "true" ]; then
             python3 scripts/kline_snapshot.py --all-a-shares --all-m30 \
               --batch-index "${{ inputs.batch_index }}" --batch-size "${{ inputs.batch_size }}" \
-              --skip-daily-weekly --workers 4 --delay 0.35 --keep 7
+              --skip-daily-weekly --workers 2 --delay 0.8 --keep 7
+          elif [ "${{ inputs.rolling_m30 }}" = "true" ]; then
+            python3 scripts/kline_snapshot.py --all-a-shares --rolling-m30 \
+              --batch-size "${{ inputs.rolling_batch_size }}" \
+              --skip-daily-weekly --workers 2 --delay 0.8 --keep 7
           else
-            # 全市场日K + 自选30分：腾讯源 2 worker × 0.8s 间隔，约 4641 请求 / 1.5-2 小时。
-            # delay 低于 0.8 会在尾段触发腾讯限流（2026-10-24 实测 0.35/0.6 损失 25%）。
-            python3 scripts/kline_snapshot.py --all-a-shares --workers 2 --delay 0.8 --keep 7
+            # 全市场日K + 自选30分 + 全市场m30滚批（每天 500 只，约 9 个交易日滚完一圈）：
+            # 腾讯源 2 worker × 0.8s 间隔。delay 低于 0.8 会在尾段触发腾讯限流
+            # （2026-10-24 实测 0.35/0.6 损失 25%）。
+            python3 scripts/kline_snapshot.py --all-a-shares --rolling-m30 \
+              --batch-size 500 --workers 2 --delay 0.8 --keep 7
           fi
+      - name: Save m30 rolling cursor
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .m30-cursor
+          key: m30-cursor-${{ github.run_id }}
