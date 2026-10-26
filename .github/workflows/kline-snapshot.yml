@@ -50,5 +50,7 @@ jobs:
               --batch-index "${{ inputs.batch_index }}" --batch-size "${{ inputs.batch_size }}" \
               --skip-daily-weekly --workers 4 --delay 0.35 --keep 7
           else
+            # 全市场日K + 自选30分：腾讯源 2 worker × 0.8s 间隔，约 4641 请求 / 1.5-2 小时。
+            # delay 低于 0.8 会在尾段触发腾讯限流（2026-10-24 实测 0.35/0.6 损失 25%）。
             python3 scripts/kline_snapshot.py --all-a-shares --workers 2 --delay 0.8 --keep 7
           fi
