@@ -107,6 +107,21 @@ def save_universe(symbols: list[str]) -> None:
     (CACHE / "_universe.json").write_text(json.dumps(symbols, separators=(",", ":")), encoding="utf-8")
 
 
+M30_CURSOR = ROOT / ".m30-cursor"
+
+def read_m30_cursor() -> int:
+    try:
+        return max(0, int(M30_CURSOR.read_text(encoding="utf-8").strip()))
+    except (OSError, ValueError):
+        return 0
+
+def write_m30_cursor(next_index: int) -> None:
+    try:
+        M30_CURSOR.write_text(str(next_index), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def fetch(symbol: str, period: str, limit: int) -> list[dict]:
     time.sleep(max(0.0, REQUEST_DELAY) + random.random() * 0.2)
     market, code = symbol[:2], symbol[2:]
@@ -287,6 +302,8 @@ def main() -> int:
     ap.add_argument("--all-m30", action="store_true", help="将全体 A 股 30 分钟数据按批次拉取")
     ap.add_argument("--batch-index", type=int, default=0, help="30 分钟批次编号，从 0 开始")
     ap.add_argument("--batch-size", type=int, default=100, help="每个 30 分钟批次的股票数")
+    ap.add_argument("--rolling-m30", action="store_true",
+                    help="日常滚批：每天在全市场 m30 滚动补一块（batch-index 自动推进并写回游标）")
     ap.add_argument("--skip-daily-weekly", action="store_true", help="批量补分钟线时跳过日线/周线")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--delay", type=float, default=0.6, help="每个行情请求前的秒数间隔")
@@ -309,13 +326,29 @@ def main() -> int:
     if not universe: raise RuntimeError("no symbols; add symbols to scripts/symbols.txt or use --all-a-shares")
     # 周线不单独请求：由日线按自然周聚合（derive_week_bars），请求量减半。
     jobs = [] if args.skip_daily_weekly else [(s, "day", PERIODS["day"][1]) for s in universe]
-    m30_symbols = universe if args.all_m30 else watched
+    m30_symbols = universe if (args.all_m30 or args.rolling_m30) else watched
     if args.all_m30:
         start = args.batch_index * args.batch_size
         m30_symbols = m30_symbols[start:start + args.batch_size]
         if not m30_symbols:
             raise RuntimeError(f"batch-index {args.batch_index} 超出范围（共 {len(universe)} 只股票）")
         print(f"m30 batch {args.batch_index}: {start}-{start + len(m30_symbols) - 1} / {len(universe)}", flush=True)
+    elif args.rolling_m30:
+        # 滚批补全：游标文件记录进度（Actions 用 artifact 缓存透传；本地直接落盘），
+        # 每天在全市场 m30 里推进一块，滚完一圈后回到 0 重新刷新（分钟线只需保留近期 320 根，
+        # 重滚即刷新，不累积）。
+        cursor = read_m30_cursor()
+        start = (cursor % len(universe)) * args.batch_size
+        m30_symbols = m30_symbols[start:start + args.batch_size]
+        if not m30_symbols:  # 末批不满
+            m30_symbols = m30_symbols[start:]
+        next_cursor = cursor + 1
+        if start + len(m30_symbols) >= len(universe):
+            next_cursor = 0  # 滚完一圈回 0
+        write_m30_cursor(next_cursor)
+        total_batches = (len(universe) + args.batch_size - 1) // args.batch_size
+        print(f"m30 rolling batch {cursor % total_batches}/{total_batches}: "
+              f"{start}-{start + len(m30_symbols) - 1} / {len(universe)}（下一轮游标 {next_cursor}）", flush=True)
     jobs += [(s, "m30", PERIODS["m30"][1]) for s in m30_symbols]
     if not jobs: raise RuntimeError("没有待执行任务")
     workers = max(1, min(args.workers, 4))
