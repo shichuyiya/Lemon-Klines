@@ -23,6 +23,11 @@ on:
         required: false
         default: '100'
         type: string
+      backfill_days:
+        description: '日线历史回填只数（向上市首日翻页，0=不回填）'
+        required: false
+        default: '0'
+        type: string
   schedule:
     # 工作日北京时间 17:30（UTC 09:30）
     - cron: '30 9 * * 1-5'
@@ -48,12 +53,13 @@ jobs:
           if [ "${{ inputs.all_m30 }}" = "true" ]; then
             python3 scripts/kline_snapshot.py --all-a-shares --all-m30 \
               --batch-index "${{ inputs.batch_index }}" --batch-size "${{ inputs.batch_size }}" \
-              --skip-daily-weekly --workers 4 --delay 0.35 --keep 7
+              --skip-daily-weekly --workers 2 --delay 0.8 --keep 7
           else
-            # 全市场日K + m30 自愈补缺（缺哪个补哪个 + 每天按最旧优先刷新 200 只）。
-            # day 与 m30 任务交错排队，死线守卫放弃的缺口下一轮自动补齐——
-            # 快照本身就是进度，无需游标/cache 跨运行透传。
-            # 腾讯源 2 worker × 0.8s 间隔，命中限流时全局冷却 30s 再战。
+            # 全市场日K + m30 自愈补缺（缺哪个补哪个 + 每天按最旧优先刷新 200 只）
+            # + 日线历史回填 150 只（向上市首日翻页，约 10 个交易日滚完全市场）。
+            # day/m30/backfill 三队列交错；day/week/month/m30 全部增量合并——
+            # 历史只增不减；死线放弃的缺口下一轮自动补齐。
             python3 scripts/kline_snapshot.py --all-a-shares \
+              --backfill-days "${{ inputs.backfill_days }}" \
               --workers 2 --delay 0.8 --m30-refresh 200 --keep 7
           fi
