@@ -59,7 +59,8 @@ jobs:
             # + 日线历史回填 150 只（向上市首日翻页，约 10 个交易日滚完全市场）。
             # day/m30/backfill 三队列交错；day/week/month/m30 全部增量合并——
             # 历史只增不减；死线放弃的缺口下一轮自动补齐。
+            # 定时触发时 inputs 为空 → 回填默认 150 只/天（约 10 个交易日滚完全市场）
             python3 scripts/kline_snapshot.py --all-a-shares \
-              --backfill-days "${{ inputs.backfill_days }}" \
+              --backfill-days "${{ inputs.backfill_days || '150' }}" \
               --workers 2 --delay 0.8 --m30-refresh 200 --keep 7
           fi
