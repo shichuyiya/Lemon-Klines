@@ -43,7 +43,7 @@ CACHE = ROOT / ".kline-cache"
 UNIVERSE_FILE = ROOT / "scripts" / "universe.json"
 SYMBOLS_FILE = ROOT / "scripts" / "symbols.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Lemon-Light-kline-backfill/1.1"
-PERIODS = {"day": (101, 1023), "week": (102, 260), "m30": (30, 2000)}
+PERIODS = {"day": (101, 1023), "week": (102, 260), "month": (103, 1023), "m30": (30, 2000)}
 # 腾讯 mkline 服务器端深度上限实测 482 根（约 3 个月），count 再大也只返回 482；
 # 更早的历史接口拿不到，靠 merge_m30_bars 把新拉取与快照旧文件增量合并来只增不减。
 M30_DEPTH = 482
@@ -54,9 +54,15 @@ REQUEST_RETRIES = 5
 # 单请求 5 次退避重试最长 8s 撑不过去，必须让所有 worker 全局冷却一起等。
 COOLDOWN_LOCK = threading.Lock()
 COOLDOWN_UNTIL = 0.0
+# 历史翻页锚点：symbol -> end 日期（取该日之前的历史页）。由 dayback 任务填充，
+# 仅在回填任务执行期间生效；普通 day 任务不带锚点（拉最新 1023 根）。
+END_ANCHOR: dict[str, str] = {}
 QQ_HOSTS = ("web.ifzq.gtimg.cn", "ifzq.gtimg.cn")
 SNAPSHOT_MAGIC = b"LKSNAP1"
-SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|m30|m60|m15|m5)\.json\.gz$|^_universe\.json$")
+SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|month|m30|m60|m15|m5)\.json\.gz$|^_universe\.json$")
+# 日线/周线翻页单页上限：qfq 接口实测 count>640 无效（c=1023 只回 641 根），
+# end+count 可向历史翻页——全历史回填靠多页拼接。
+FQ_PAGE_COUNT = 640
 
 
 def http_json(url: str, retries: int = REQUEST_RETRIES) -> dict:
@@ -144,9 +150,10 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?"
                f"param={symbol},m30,,,{limit}")
     else:
-        kind = "day" if period == "day" else "week"
+        kind = {"day": "day", "week": "week", "month": "month"}[period]
+        end = f",{END_ANCHOR[symbol]}" if symbol in END_ANCHOR else ""
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
-               f"param={symbol},{kind},,,{limit},qfq")
+               f"param={symbol},{kind},{end},,{limit},qfq")
     data = http_json(url).get("data") or {}
     node = data.get(symbol) or {}
     if period == "m30":
@@ -161,7 +168,7 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
             except (ValueError, IndexError):
                 continue
         return out
-    rows = node.get(f"qfq{period if period != 'day' else 'day'}") or node.get(period) or []
+    rows = node.get(f"qfq{period}") or node.get(period) or []
     out = []
     for p in rows:
         if len(p) < 6: continue
@@ -180,9 +187,10 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
     return out
 
 
-def save_cache(symbol: str, period: str, bars: list[dict]) -> None:
+def save_cache(symbol: str, period: str, bars: list[dict], **extra) -> None:
     CACHE.mkdir(parents=True, exist_ok=True)
     payload = {"symbol": symbol, "tf": period, "bars": bars, "updatedAt": int(time.time() * 1000)}
+    payload.update(extra)
     (CACHE / f"{symbol}.{period}.json.gz").write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode()))
 
 
@@ -194,15 +202,60 @@ def load_cache_bars(symbol: str, period: str) -> list[dict]:
         return []
 
 
-def merge_m30_bars(symbol: str, fresh: list[dict]) -> list[dict]:
-    """增量合并：腾讯 m30 接口只回约 482 根（约 3 个月），直接覆盖会滚动丢历史。
-    旧文件 + 新拉取按 date 去重（新值优先），按时间排序后整体保留。"""
-    if not fresh: return load_cache_bars(symbol, "m30")
-    old = load_cache_bars(symbol, "m30")
+def load_cache_meta(symbol: str, period: str) -> dict:
+    try:
+        with gzip.open(CACHE / f"{symbol}.{period}.json.gz", "rt", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def merge_bars(symbol: str, period: str, fresh: list[dict]) -> list[dict]:
+    """增量合并：m30 接口只回约 482 根、day/week 回最近约 640 根，直接覆盖都会
+    滚动丢历史。旧文件 + 新拉取按 date 去重（新值优先），按时间排序后整体保留。"""
+    if not fresh: return load_cache_bars(symbol, period)
+    old = load_cache_bars(symbol, period)
     if not old: return fresh
     merged = {b["date"]: b for b in old}
     merged.update({b["date"]: b for b in fresh})
     return [merged[k] for k in sorted(merged)]
+
+
+# 兼容旧名
+merge_m30_bars = lambda symbol, fresh: merge_bars(symbol, "m30", fresh)
+
+
+def dayback(symbol: str) -> tuple[list[dict], bool]:
+    """全历史回填：从快照已有最早日线的前一天起，用 end+count 向历史翻页，
+    直到服务器返回尽头（页不足或空）。返回 (合并后全部日线, 是否触底)。"""
+    existing = load_cache_bars(symbol, "day")
+    if not existing:
+        # 快照没有该股日线：先拉最新一段作为起点
+        END_ANCHOR[symbol] = ""
+        latest = fetch(symbol, "day", PERIODS["day"][1])
+        if not latest: return [], False
+        existing = latest
+    oldest = min(b["date"] for b in existing)
+    all_bars: dict[str, dict] = {b["date"]: b for b in existing}
+    touched_bottom = False
+    pages = 0
+    while not touched_bottom and pages < 60:  # 60 页 × 640 根远超任何 A 股历史（平安 1991 上市约 8600 根）
+        END_ANCHOR[symbol] = oldest
+        try:
+            page = fetch(symbol, "day", FQ_PAGE_COUNT)
+        finally:
+            END_ANCHOR.pop(symbol, None)
+        fresh = [b for b in page if b["date"] < oldest]
+        for b in fresh:
+            all_bars.setdefault(b["date"], b)
+        if not fresh or len(page) < FQ_PAGE_COUNT:
+            touched_bottom = True  # 服务器翻过上市首日
+            break
+        oldest = min(b["date"] for b in fresh)
+        pages += 1
+        time.sleep(max(0.0, REQUEST_DELAY) + random.random() * 0.2)
+    merged = [all_bars[k] for k in sorted(all_bars)]
+    return merged, touched_bottom
 
 
 def derive_week_bars(day_bars: list[dict]) -> list[dict]:
@@ -212,6 +265,26 @@ def derive_week_bars(day_bars: list[dict]) -> list[dict]:
         y, m, d = b["date"].split("-")
         iso = date(int(y), int(m), int(d)).isocalendar()
         grouped.setdefault((iso[0], iso[1]), []).append(b)
+    out: list[dict] = []
+    for key in sorted(grouped):
+        days = grouped[key]
+        out.append({
+            "date": days[-1]["date"],
+            "open": days[0]["open"],
+            "close": days[-1]["close"],
+            "high": max(x["high"] for x in days),
+            "low": min(x["low"] for x in days),
+            "volume": sum(x["volume"] for x in days),
+            "amount": sum(x.get("amount", 0.0) for x in days),
+        })
+    return out
+
+
+def derive_month_bars(day_bars: list[dict]) -> list[dict]:
+    """由日线聚合月线（口径同周线：月末交易日为日期、首日开、末日收、极值高低、量额求和）。"""
+    grouped: dict[str, list[dict]] = {}
+    for b in day_bars:
+        grouped.setdefault(b["date"][:7], []).append(b)
     out: list[dict] = []
     for key in sorted(grouped):
         days = grouped[key]
@@ -338,6 +411,8 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=100, help="每个 30 分钟批次的股票数")
     ap.add_argument("--m30-refresh", type=int, default=200,
                     help="自愈模式下每天额外刷新的 m30 文件数（按 updatedAt 最旧优先，0 关闭）")
+    ap.add_argument("--backfill-days", type=int, default=0,
+                    help="历史回填模式：为 N 只最早日线仍不全的股票向上市首日翻页补齐（0 关闭）")
     ap.add_argument("--skip-daily-weekly", action="store_true", help="批量补分钟线时跳过日线/周线")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--delay", type=float, default=0.6, help="每个行情请求前的秒数间隔")
@@ -359,14 +434,31 @@ def main() -> int:
     else:
         universe = watched
     if not universe: raise RuntimeError("no symbols; add symbols to scripts/symbols.txt or use --all-a-shares")
-    # 周线不单独请求：由日线按自然周聚合（derive_week_bars），请求量减半。
+    # 数据完整性策略：day/week/month/m30 全部增量合并（历史只增不减）。
+    # week 由合并后的全历史日线聚合（口径统一、零请求）；month 由日线按自然月聚合，
+    # 两者都随每次 day 刷新自动更新，无需单独请求。
     # m30 自愈补缺：快照本身就是进度——恢复后缺哪个文件补哪个，另外按 updatedAt
-    # 最旧优先刷新配额（分钟线只留近期 320 根，重刷即更新，不累积）。
-    # 快照文件时间戳即进度，无需游标/cache 跨运行透传。
+    # 最旧优先刷新配额。dayback 模式则为存量日线向上市首日翻页回填。
+    # 快照文件即进度，无需游标/cache 跨运行透传。
     day_jobs: list[tuple[str, str, int]] = []
     m30_jobs: list[tuple[str, str, int]] = []
+    backfill_jobs: list[str] = []
     if not args.skip_daily_weekly:
         day_jobs = [(s, "day", PERIODS["day"][1]) for s in universe]
+    if args.backfill_days > 0 and restored:
+        # 选股：优先回填最早日线离今天最远的股票（老股先回填）。
+        # 已触底（backfilled=true）的跳过；没有 day 文件的靠日常 day 任务先建档。
+        scored: list[tuple[str, str]] = []
+        for s in universe:
+            meta = load_cache_meta(s, "day")
+            bars = meta.get("bars") or []
+            if not bars or meta.get("backfilled"):
+                continue
+            scored.append((bars[0]["date"], s))  # bars 已按时间排序
+        scored.sort()
+        backfill_jobs = [s for _, s in scored[:args.backfill_days]]
+        print(f"day backfill: {len(backfill_jobs)} stocks (oldest first), "
+              f"pending total {len(scored)}", flush=True)
     if args.all_m30:
         start = args.batch_index * args.batch_size
         m30_batch = universe[start:start + args.batch_size]
@@ -393,13 +485,17 @@ def main() -> int:
         print(f"m30 self-heal: {len(m30_missing)} missing + {len(stale)} refresh / {len(universe)} universe", flush=True)
     else:
         m30_jobs = [(s, "m30", PERIODS["m30"][1]) for s in watched]
-    # 交错调度：day 与 m30 穿插排队，day 全量失速时 m30 依然持续产出
-    jobs: list[tuple[str, str, int]] = []
-    di = mi = 0
-    while di < len(day_jobs) or mi < len(m30_jobs):
-        for _ in range(4):
-            if di < len(day_jobs): jobs.append(day_jobs[di]); di += 1
-        if mi < len(m30_jobs): jobs.append(m30_jobs[mi]); mi += 1
+    # 交错调度：day / m30 / dayback 穿插排队，任一队列失速时其他照常产出
+    jobs: list[tuple[str, str, int]] = []  # (symbol, kind, limit)  kind: day/m30/backfill
+    queues = [day_jobs, m30_jobs, [(s, "backfill", 0) for s in backfill_jobs]]
+    qi = [0, 0, 0]
+    while any(qi[k] < len(queues[k]) for k in range(3)):
+        for k in range(3):
+            if k == 1:  # m30 队列每轮推 1 个
+                if qi[1] < len(queues[1]): jobs.append(queues[1][qi[1]]); qi[1] += 1
+                continue
+            for _ in range(3 if k == 0 else 1):
+                if qi[k] < len(queues[k]): jobs.append(queues[k][qi[k]]); qi[k] += 1
     if not jobs: raise RuntimeError("没有待执行任务")
     workers = max(1, min(args.workers, 4))
     # 死线守卫：Actions 单 job 6 小时硬上限，5.5 小时强制收尾——
@@ -407,28 +503,40 @@ def main() -> int:
     # 保证无论如何都能走到打包发布那一步。
     started = time.monotonic()
     deadline = started + 5.5 * 3600
+
+    def run_job(s: str, kind: str, _lim: int):
+        if kind == "backfill":
+            return dayback(s)
+        return fetch(s, kind, _lim), True
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch, s, p, lim): (s, p) for s, p, lim in jobs}
+        futures = {pool.submit(run_job, s, k, lim): (s, k) for s, k, lim in jobs}
         failures = []
         aborted = 0
         for i, fut in enumerate(as_completed(futures), 1):
-            s, p = futures[fut]
+            s, k = futures[fut]
             if time.monotonic() > deadline:
                 aborted = len(futures) - i + 1
                 break
             try:
-                bars = fut.result()
+                bars, complete = fut.result()
             except Exception as exc:
-                failures.append(f"{s} {p}: {exc}")
-                print(f"[{i}/{len(futures)}] FAILED {s} {p}: {exc}", flush=True)
+                failures.append(f"{s} {k}: {exc}")
+                print(f"[{i}/{len(futures)}] FAILED {s} {k}: {exc}", flush=True)
+                continue
+            if k == "backfill":
+                # 回填结果整体落盘（dayback 内部已合并旧数据），并打触底标记
+                save_cache(s, "day", bars, backfilled=complete)
+                if bars: save_cache(s, "week", derive_week_bars(bars))
+                print(f"[{i}/{len(futures)}] {s} backfill {len(bars)} bottom={complete}", flush=True)
                 continue
             if bars:
-                if p == "m30":
-                    bars = merge_m30_bars(s, bars)  # 增量合并，防止 3 个月外的历史被覆盖丢失
-                save_cache(s, p, bars)
-                if p == "day":
+                bars = merge_bars(s, k, bars)  # 增量合并，历史只增不减
+                save_cache(s, k, bars, **({"backfilled": True} if k == "day" and complete and len(bars) >= FQ_PAGE_COUNT else {}))
+                if k == "day":
                     save_cache(s, "week", derive_week_bars(bars))
-            print(f"[{i}/{len(futures)}] {s} {p} {len(bars)}", flush=True)
+                    save_cache(s, "month", derive_month_bars(bars))
+            print(f"[{i}/{len(futures)}] {s} {k} {len(bars)}", flush=True)
         if aborted:
             for f in futures:
                 f.cancel()
