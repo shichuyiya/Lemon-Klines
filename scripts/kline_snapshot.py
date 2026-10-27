@@ -43,7 +43,10 @@ CACHE = ROOT / ".kline-cache"
 UNIVERSE_FILE = ROOT / "scripts" / "universe.json"
 SYMBOLS_FILE = ROOT / "scripts" / "symbols.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Lemon-Light-kline-backfill/1.1"
-PERIODS = {"day": (101, 1023), "week": (102, 260), "m30": (30, 320)}
+PERIODS = {"day": (101, 1023), "week": (102, 260), "m30": (30, 2000)}
+# 腾讯 mkline 服务器端深度上限实测 482 根（约 3 个月），count 再大也只返回 482；
+# 更早的历史接口拿不到，靠 merge_m30_bars 把新拉取与快照旧文件增量合并来只增不减。
+M30_DEPTH = 482
 REQUEST_DELAY = 0.35
 REQUEST_TIMEOUT = 60
 REQUEST_RETRIES = 5
@@ -136,8 +139,10 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
     time.sleep(max(0.0, REQUEST_DELAY) + random.random() * 0.2)
     market, code = symbol[:2], symbol[2:]
     if period == "m30":
+        # 5 段 param（留空 start/end）才能拿到服务器最大深度 482 根；4 段只给 320。
+        # count 传大值由服务器截断，等于每次拉满。
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?"
-               f"param={symbol},m30,,{limit}")
+               f"param={symbol},m30,,,{limit}")
     else:
         kind = "day" if period == "day" else "week"
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
@@ -179,6 +184,25 @@ def save_cache(symbol: str, period: str, bars: list[dict]) -> None:
     CACHE.mkdir(parents=True, exist_ok=True)
     payload = {"symbol": symbol, "tf": period, "bars": bars, "updatedAt": int(time.time() * 1000)}
     (CACHE / f"{symbol}.{period}.json.gz").write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode()))
+
+
+def load_cache_bars(symbol: str, period: str) -> list[dict]:
+    try:
+        with gzip.open(CACHE / f"{symbol}.{period}.json.gz", "rt", encoding="utf-8") as fh:
+            return json.load(fh).get("bars") or []
+    except (OSError, ValueError):
+        return []
+
+
+def merge_m30_bars(symbol: str, fresh: list[dict]) -> list[dict]:
+    """增量合并：腾讯 m30 接口只回约 482 根（约 3 个月），直接覆盖会滚动丢历史。
+    旧文件 + 新拉取按 date 去重（新值优先），按时间排序后整体保留。"""
+    if not fresh: return load_cache_bars(symbol, "m30")
+    old = load_cache_bars(symbol, "m30")
+    if not old: return fresh
+    merged = {b["date"]: b for b in old}
+    merged.update({b["date"]: b for b in fresh})
+    return [merged[k] for k in sorted(merged)]
 
 
 def derive_week_bars(day_bars: list[dict]) -> list[dict]:
@@ -399,6 +423,8 @@ def main() -> int:
                 print(f"[{i}/{len(futures)}] FAILED {s} {p}: {exc}", flush=True)
                 continue
             if bars:
+                if p == "m30":
+                    bars = merge_m30_bars(s, bars)  # 增量合并，防止 3 个月外的历史被覆盖丢失
                 save_cache(s, p, bars)
                 if p == "day":
                     save_cache(s, "week", derive_week_bars(bars))
