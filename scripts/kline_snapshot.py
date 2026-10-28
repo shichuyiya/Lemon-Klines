@@ -444,7 +444,14 @@ def main() -> int:
     m30_jobs: list[tuple[str, str, int]] = []
     backfill_jobs: list[str] = []
     if not args.skip_daily_weekly:
-        day_jobs = [(s, "day", PERIODS["day"][1]) for s in universe]
+        # 缺失优先：快照里没有 day 文件的排最前（死线截断时优先补齐缺口），
+        # 其余按 universe 顺序每天刷新（更新最新 K 线 + 复权因子）
+        day_existing = {p.name.split(".")[0] for p in CACHE.glob("*.day.json.gz")}
+        day_missing = [s for s in universe if s not in day_existing]
+        day_rest = [s for s in universe if s in day_existing]
+        day_jobs = [(s, "day", PERIODS["day"][1]) for s in day_missing + day_rest]
+        if day_missing:
+            print(f"day first-pass: {len(day_missing)} missing pushed to front", flush=True)
     if args.backfill_days > 0 and restored:
         # 选股：优先回填最早日线离今天最远的股票（老股先回填）。
         # 已触底（backfilled=true）的跳过；没有 day 文件的靠日常 day 任务先建档。
@@ -485,16 +492,15 @@ def main() -> int:
         print(f"m30 self-heal: {len(m30_missing)} missing + {len(stale)} refresh / {len(universe)} universe", flush=True)
     else:
         m30_jobs = [(s, "m30", PERIODS["m30"][1]) for s in watched]
-    # 交错调度：day / m30 / dayback 穿插排队，任一队列失速时其他照常产出
+    # 交错调度：m30 缺口大时多排（2:1），day 已齐全后只是刷新。
+    # 队列形状：day×1 + m30×2 + backfill×1 每轮，任一队列失速时其他照常产出
     jobs: list[tuple[str, str, int]] = []  # (symbol, kind, limit)  kind: day/m30/backfill
     queues = [day_jobs, m30_jobs, [(s, "backfill", 0) for s in backfill_jobs]]
+    quota = [1, 2, 1]
     qi = [0, 0, 0]
     while any(qi[k] < len(queues[k]) for k in range(3)):
         for k in range(3):
-            if k == 1:  # m30 队列每轮推 1 个
-                if qi[1] < len(queues[1]): jobs.append(queues[1][qi[1]]); qi[1] += 1
-                continue
-            for _ in range(3 if k == 0 else 1):
+            for _ in range(quota[k]):
                 if qi[k] < len(queues[k]): jobs.append(queues[k][qi[k]]); qi[k] += 1
     if not jobs: raise RuntimeError("没有待执行任务")
     workers = max(1, min(args.workers, 4))
