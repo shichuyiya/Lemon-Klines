@@ -40,19 +40,38 @@ def keep(code: str) -> bool:
     return len(code) == 6 and code.isdigit() and code.startswith(_KEEP_PREFIX)
 
 
-def download_zip(market: str, dest: Path, timeout: int = 600) -> Path:
-    """下载 {market}lday.zip（sh/sz/bj）。已存在且 >1MB 跳过。"""
-    if dest.exists() and dest.stat().st_size > (1 << 20):
-        return dest
-    url = f"{TDX_BASE}/{market}lday.zip"
+def download_zip(market: str, dest: Path, timeout: int = 600, retries: int = 3) -> Path:
+    """下载 {market}lday.zip（sh/sz/bj）。已存在且校验通过则跳过。
+
+    下载中断/CDN 异常会产生截断或 HTML 伪装文件（>1MB 但不是 zip，
+    实测 Actions runner 上出现过），必须用 is_zipfile 校验——
+    残缺 zip 缺 central directory，is_zipfile 返回 False。
+    校验失败自动重下，重试耗尽抛 RuntimeError 由调用方回退。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as res, dest.open("wb") as f:
-        while True:
-            chunk = res.read(1 << 20)
-            if not chunk: break
-            f.write(chunk)
-    return dest
+    url = f"{TDX_BASE}/{market}lday.zip"
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        if dest.exists() and dest.stat().st_size > (1 << 20) and zipfile.is_zipfile(dest):
+            return dest
+        if dest.exists():  # 残留的截断/损坏文件，删掉重下
+            try: dest.unlink()
+            except OSError: pass
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as res, dest.open("wb") as f:
+                while True:
+                    chunk = res.read(1 << 20)
+                    if not chunk: break
+                    f.write(chunk)
+            if zipfile.is_zipfile(dest):
+                return dest
+            last = zipfile.BadZipFile(
+                f"{market}lday.zip downloaded but invalid (size={dest.stat().st_size})")
+        except (urllib.error.URLError, TimeoutError, OSError, zipfile.BadZipFile) as exc:
+            last = exc
+        print(f"tdx {market}lday.zip attempt {attempt}/{retries} failed: {last}", flush=True)
+        time.sleep(10 * attempt)
+    raise RuntimeError(f"{market}lday.zip download failed after {retries} attempts: {last}")
 
 
 def parse_lday_zip(zip_path: Path, market: str) -> dict[str, list[dict]]:
