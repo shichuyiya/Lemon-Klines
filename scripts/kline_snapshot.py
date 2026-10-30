@@ -422,14 +422,18 @@ def ingest_tdx_daily(universe: list[str]) -> tuple[int, int]:
         if not syms: continue
         try:
             zips[mkt] = tdxlday.download_zip(mkt, ROOT / f".tdx-{mkt}lday.zip")
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except Exception as exc:  # 下载/校验失败回退腾讯翻页，不阻塞快照发布
             print(f"tdx {mkt}lday.zip download failed: {exc} — fallback to tencent pages", flush=True)
     if not zips:
         return 0, 0
     total_new = 0
     ingested = 0
     for mkt, zp in zips.items():
-        parsed = tdxlday.parse_lday_zip(zp, mkt)
+        try:
+            parsed = tdxlday.parse_lday_zip(zp, mkt)
+        except Exception as exc:  # zip 二次损坏（如磁盘满/半写）跳过该市场
+            print(f"tdx {mkt}lday parse failed: {exc} — skip this market", flush=True)
+            continue
         print(f"tdx {mkt}lday parsed: {len(parsed)} stocks", flush=True)
         for sym, raw_bars in parsed.items():
             if sym not in universe_set: continue
