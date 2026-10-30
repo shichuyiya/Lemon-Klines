@@ -38,6 +38,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tdxlday  # 通达信官网日线包底座 + 前复权（锚定比值法）
+
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / ".kline-cache"
 UNIVERSE_FILE = ROOT / "scripts" / "universe.json"
@@ -403,6 +406,62 @@ def publish(snapshot: Path, repo: str, token: str, keep: int) -> None:
         for old in assets[keep:]: gh("DELETE", f"{base}/releases/assets/{old['id']}", token)
 
 
+def ingest_tdx_daily(universe: list[str]) -> tuple[int, int]:
+    """通达信官网日线包灌底座：全历史原始价 + 锚定比值前复权。
+
+    对 universe 中每只股票：
+    - 官网 .day 原始全历史为骨架（QFQ_COVER 覆盖区内已有腾讯 qfq 的除外）
+    - 快照里已有的腾讯 qfq 日线（最近 ~640 根，天然前复权）优先级更高——
+      重叠区直接采用；更早历史 × (重叠首日 qfq收/原始收) 比值
+    - 结果与快照旧文件 merge 后落盘，全历史只增不减
+    返回 (灌入股票数, 新增 bar 总数)。
+    """
+    zips: dict[str, Path] = {}
+    for mkt in ("sh", "sz", "bj"):
+        syms = [s for s in universe if s.startswith(mkt)]
+        if not syms: continue
+        try:
+            zips[mkt] = tdxlday.download_zip(mkt, ROOT / f".tdx-{mkt}lday.zip")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            print(f"tdx {mkt}lday.zip download failed: {exc} — fallback to tencent pages", flush=True)
+    if not zips:
+        return 0, 0
+    total_new = 0
+    ingested = 0
+    for mkt, zp in zips.items():
+        parsed = tdxlday.parse_lday_zip(zp, mkt)
+        print(f"tdx {mkt}lday parsed: {len(parsed)} stocks", flush=True)
+        for sym, raw_bars in parsed.items():
+            if sym not in universe_set: continue
+            old = load_cache_bars(sym, "day")
+            qfq_cover = {b["date"]: b for b in old}  # 快照现有 = 腾讯 qfq（天然前复权）
+            merged_map = {b["date"]: b for b in old}
+            # 历史段：不在 qfq 覆盖区内的原始价 × 锚定比值
+            ratio = tdxlday.anchor_ratio(raw_bars, list(qfq_cover.values()))[0] if qfq_cover else 1.0
+            for b in raw_bars:
+                if b["date"] in qfq_cover:
+                    continue  # qfq 覆盖区优先，不动
+                if ratio != 1.0:
+                    b = {**b, "open": round(b["open"] * ratio, 4), "high": round(b["high"] * ratio, 4),
+                         "low": round(b["low"] * ratio, 4), "close": round(b["close"] * ratio, 4)}
+                if b["date"] not in merged_map:
+                    merged_map[b["date"]] = b
+                    total_new += 1
+            merged = [merged_map[k] for k in sorted(merged_map)]
+            meta = load_cache_meta(sym, "day")
+            backfilled = bool(meta.get("backfilled"))
+            if merged and merged[0]["date"] <= min(b["date"] for b in raw_bars):
+                backfilled = True  # 历史已触达官网包起点（上市首日），不再需要 dayback 翻页
+            save_cache(sym, "day", merged, backfilled=backfilled)
+            save_cache(sym, "week", derive_week_bars(merged))
+            save_cache(sym, "month", derive_month_bars(merged))
+            ingested += 1
+    return ingested, total_new
+
+
+universe_set: set[str] = set()  # ingest_tdx_daily 引用，main() 里赋值
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--all-a-shares", action="store_true", help="使用 scripts/universe.json 全量（默认）")
@@ -434,6 +493,14 @@ def main() -> int:
     else:
         universe = watched
     if not universe: raise RuntimeError("no symbols; add symbols to scripts/symbols.txt or use --all-a-shares")
+    universe_set.clear()
+    universe_set.update(universe)
+    # 通达信官网包灌底座：一次下载拿到全市场全历史原始价（不复权），
+    # 与快照内腾讯 qfq 锚定合并 → 全历史前复权，day 翻页回填（dayback）就此退役。
+    # 下载失败自动回退现有腾讯逐股路径，不影响本次运行。
+    if not args.skip_daily_weekly:
+        ingested, added = ingest_tdx_daily(universe)
+        print(f"tdx base ingested: {ingested} stocks, {added} new bars", flush=True)
     # 数据完整性策略：day/week/month/m30 全部增量合并（历史只增不减）。
     # week 由合并后的全历史日线聚合（口径统一、零请求）；month 由日线按自然月聚合，
     # 两者都随每次 day 刷新自动更新，无需单独请求。
