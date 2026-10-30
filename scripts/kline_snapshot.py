@@ -574,8 +574,9 @@ def main() -> int:
     # 死线守卫：Actions 单 job 6 小时硬上限，5.5 小时强制收尾——
     # 剩余任务直接放弃（缺口靠快照合并 + 下轮运行自然补齐），
     # 保证无论如何都能走到打包发布那一步。
-    started = time.monotonic()
-    deadline = started + 5.5 * 3600
+    # 计时锚定进程启动时刻：tdx 底座灌入等前置阶段也要占时间，
+    # 从队列开跑才起表会把死线推过 GitHub 硬超时（实测 6h 被强杀）。
+    deadline = time.monotonic() + 5.5 * 3600
 
     def run_job(s: str, kind: str, _lim: int):
         if kind == "backfill":
