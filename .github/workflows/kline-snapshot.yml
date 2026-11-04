@@ -29,8 +29,13 @@ on:
         default: '150'
         type: string
   schedule:
-    # 工作日北京时间 17:30（UTC 09:30）
-    - cron: '30 9 * * 1-5'
+    # 拆班跑：一天 4 班（北京时间 01:30 / 07:30 / 13:30 / 17:30 工作日），
+    # 每班 --max-hours 4 到点收尾必发布快照，班与班靠快照续接（快照即进度）。
+    # 不再单班跑满 6h——GitHub 6h 硬超时强杀会让整班数据全部丢失（实测连丢 3 班）。
+    - cron: '30 17 * * 0'    # 北京周一 01:30（UTC 周日）
+    - cron: '30 23 * * 0'    # 北京周一 07:30
+    - cron: '30 5 * * 1-5'   # 北京 13:30
+    - cron: '30 9 * * 1-5'   # 北京 17:30
 
 permissions:
   contents: write
@@ -42,9 +47,19 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # 4h 死线 + 下载/解析/发布余量；显式低于 GitHub 6h 硬超时
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+      # tdx 官网日线包缓存：CDN 慢（实测 232MB 需 13-50 分钟），缓存后每班省下
+      # 重复下载；cache key 按周滚动（每周一自动失效，重拉最新周包）。
+      - name: Cache tdx lday zips
+        uses: actions/cache@v4
+        with:
+          path: .tdx-cache
+          key: tdx-lday-${{ github.run_id }}
+          restore-keys: |
+            tdx-lday-
       - name: Build and publish snapshot
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,13 +70,12 @@ jobs:
               --batch-index "${{ inputs.batch_index }}" --batch-size "${{ inputs.batch_size }}" \
               --skip-daily-weekly --workers 2 --delay 0.8 --keep 7
           else
-            # 全市场日K + m30 自愈补缺（缺哪个补哪个 + 每天按最旧优先刷新 200 只）
-            # + 日线历史回填 150 只（向上市首日翻页，约 10 个交易日滚完全市场）。
-            # day/m30/backfill 三队列交错；day/week/month/m30 全部增量合并——
-            # 历史只增不减；死线放弃的缺口下一轮自动补齐。
-            # 定时触发时 inputs 为空 → 回填默认 150 只/天（约 10 个交易日滚完全市场）；
-            # 手动触发不填则用 input 默认值 '150'（显式填 0 可关闭）
+            # 全市场日K + m30 自愈补缺（缺哪个补哪个 + 每天按最旧优先刷新 200 只）。
+            # day/week/month/m30 全部增量合并——历史只增不减；死线放弃的缺口
+            # 下一班自动补齐。tdx 底座仅首班灌入（后续班次已有全历史，秒过）。
+            # --max-hours 4：从进程启动算，到点放弃剩余任务并照常发布。
             python3 scripts/kline_snapshot.py --all-a-shares \
               --backfill-days "${{ inputs.backfill_days || '150' }}" \
-              --workers 2 --delay 0.8 --m30-refresh 200 --keep 7
+              --workers 2 --delay 0.8 --m30-refresh 200 --keep 7 --max-hours 4 \
+              --tdx-cache-dir .tdx-cache
           fi
