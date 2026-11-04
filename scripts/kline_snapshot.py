@@ -47,6 +47,10 @@ UNIVERSE_FILE = ROOT / "scripts" / "universe.json"
 SYMBOLS_FILE = ROOT / "scripts" / "symbols.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Lemon-Light-kline-backfill/1.1"
 PERIODS = {"day": (101, 1023), "week": (102, 260), "month": (103, 1023), "m30": (30, 2000)}
+# 死线守卫锚点：进程启动时刻（模块加载即起表）。GitHub 单 job 6h 硬超时从 job
+# 启动算起，快照恢复/tdx 下载灌底座（CDN 慢时 50 分钟+）都吃预算——若在队列
+# 开跑才起表，死线会被推过硬超时，快照来不及打包发布（实测连续 3 轮 6h 强杀）。
+PROCESS_STARTED = time.monotonic()
 # 腾讯 mkline 服务器端深度上限实测 482 根（约 3 个月），count 再大也只返回 482；
 # 更早的历史接口拿不到，靠 merge_m30_bars 把新拉取与快照旧文件增量合并来只增不减。
 M30_DEPTH = 482
@@ -417,11 +421,13 @@ def ingest_tdx_daily(universe: list[str]) -> tuple[int, int]:
     返回 (灌入股票数, 新增 bar 总数)。
     """
     zips: dict[str, Path] = {}
+    cache_dir = ROOT / args.tdx_cache_dir if getattr(args, "tdx_cache_dir", "") else None
     for mkt in ("sh", "sz", "bj"):
         syms = [s for s in universe if s.startswith(mkt)]
         if not syms: continue
+        dest = (cache_dir / f"{mkt}lday.zip") if cache_dir else ROOT / f".tdx-{mkt}lday.zip"
         try:
-            zips[mkt] = tdxlday.download_zip(mkt, ROOT / f".tdx-{mkt}lday.zip")
+            zips[mkt] = tdxlday.download_zip(mkt, dest)
         except Exception as exc:  # 下载/校验失败回退腾讯翻页，不阻塞快照发布
             print(f"tdx {mkt}lday.zip download failed: {exc} — fallback to tencent pages", flush=True)
     if not zips:
@@ -480,6 +486,10 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--delay", type=float, default=0.6, help="每个行情请求前的秒数间隔")
     ap.add_argument("--keep", type=int, default=7)
+    ap.add_argument("--max-hours", type=float, default=5.5,
+                    help="进程级死线（小时，从进程启动算起）：到点放弃剩余任务并照常发布快照")
+    ap.add_argument("--tdx-cache-dir", type=str, default="",
+                    help="tdx 官网日线包缓存目录（Actions cache 复用，免每班重下）")
     args = ap.parse_args()
     global REQUEST_DELAY
     REQUEST_DELAY = max(0.0, args.delay)
@@ -575,12 +585,11 @@ def main() -> int:
                 if qi[k] < len(queues[k]): jobs.append(queues[k][qi[k]]); qi[k] += 1
     if not jobs: raise RuntimeError("没有待执行任务")
     workers = max(1, min(args.workers, 4))
-    # 死线守卫：Actions 单 job 6 小时硬上限，5.5 小时强制收尾——
-    # 剩余任务直接放弃（缺口靠快照合并 + 下轮运行自然补齐），
-    # 保证无论如何都能走到打包发布那一步。
-    # 计时锚定进程启动时刻：tdx 底座灌入等前置阶段也要占时间，
-    # 从队列开跑才起表会把死线推过 GitHub 硬超时（实测 6h 被强杀）。
-    deadline = time.monotonic() + 5.5 * 3600
+    # 死线守卫：从进程启动时刻起算（PROCESS_STARTED，模块加载即起表），
+    # 覆盖快照恢复/tdx 下载灌底座等前置阶段的耗时。到点放弃剩余任务
+    # （缺口靠快照合并 + 下轮运行自然补齐），保证走到打包发布那一步。
+    # --max-hours 应显式小于 GitHub timeout-minutes 留出发布余量。
+    deadline = PROCESS_STARTED + args.max_hours * 3600
 
     def run_job(s: str, kind: str, _lim: int):
         if kind == "backfill":
