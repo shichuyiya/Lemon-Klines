@@ -410,7 +410,7 @@ def publish(snapshot: Path, repo: str, token: str, keep: int) -> None:
         for old in assets[keep:]: gh("DELETE", f"{base}/releases/assets/{old['id']}", token)
 
 
-def ingest_tdx_daily(universe: list[str]) -> tuple[int, int]:
+def ingest_tdx_daily(universe: list[str], cache_dir: Path | None = None) -> tuple[int, int]:
     """通达信官网日线包灌底座：全历史原始价 + 锚定比值前复权。
 
     对 universe 中每只股票：
@@ -421,7 +421,6 @@ def ingest_tdx_daily(universe: list[str]) -> tuple[int, int]:
     返回 (灌入股票数, 新增 bar 总数)。
     """
     zips: dict[str, Path] = {}
-    cache_dir = ROOT / args.tdx_cache_dir if getattr(args, "tdx_cache_dir", "") else None
     for mkt in ("sh", "sz", "bj"):
         syms = [s for s in universe if s.startswith(mkt)]
         if not syms: continue
@@ -513,7 +512,8 @@ def main() -> int:
     # 与快照内腾讯 qfq 锚定合并 → 全历史前复权，day 翻页回填（dayback）就此退役。
     # 下载失败自动回退现有腾讯逐股路径，不影响本次运行。
     if not args.skip_daily_weekly:
-        ingested, added = ingest_tdx_daily(universe)
+        tdx_cache = ROOT / args.tdx_cache_dir if args.tdx_cache_dir else None
+        ingested, added = ingest_tdx_daily(universe, tdx_cache)
         print(f"tdx base ingested: {ingested} stocks, {added} new bars", flush=True)
     # 数据完整性策略：day/week/month/m30 全部增量合并（历史只增不减）。
     # week 由合并后的全历史日线聚合（口径统一、零请求）；month 由日线按自然月聚合，
