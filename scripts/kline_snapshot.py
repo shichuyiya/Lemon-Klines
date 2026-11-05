@@ -40,10 +40,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tdxlday  # 通达信官网日线包底座 + 前复权（锚定比值法）
+import futures_daily  # 新浪期货主连品种 K 线（day 全历史 + m30）
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / ".kline-cache"
 UNIVERSE_FILE = ROOT / "scripts" / "universe.json"
+FUTURES_UNIVERSE_FILE = ROOT / "scripts" / "futures_universe.json"
 SYMBOLS_FILE = ROOT / "scripts" / "symbols.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Lemon-Light-kline-backfill/1.1"
 PERIODS = {"day": (101, 1023), "week": (102, 260), "month": (103, 1023), "m30": (30, 2000)}
@@ -66,7 +68,8 @@ COOLDOWN_UNTIL = 0.0
 END_ANCHOR: dict[str, str] = {}
 QQ_HOSTS = ("web.ifzq.gtimg.cn", "ifzq.gtimg.cn")
 SNAPSHOT_MAGIC = b"LKSNAP1"
-SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|month|m30|m60|m15|m5)\.json\.gz$|^_universe\.json$")
+# 股票: sh/sz/bj+6位数字；期货主连: nf_+品种缩写+0（如 nf_RB0，见 futures_universe.json）
+SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|month|m30|m60|m15|m5)\.json\.gz$|^_universe\.json$|^_futures_universe\.json$|^nf_[A-Z]{1,3}0\.(?:day|week|month|m30)\.json\.gz$")
 # 日线/周线翻页单页上限：qfq 接口实测 count>640 无效（c=1023 只回 641 根），
 # end+count 可向历史翻页——全历史回填靠多页拼接。
 FQ_PAGE_COUNT = 640
@@ -468,6 +471,60 @@ def ingest_tdx_daily(universe: list[str], cache_dir: Path | None = None) -> tupl
     return ingested, total_new
 
 
+def load_futures_universe() -> list[dict]:
+    """读取期货主连品种清单 [{symbol, name, exchange}]；缺失/损坏返回空。"""
+    try:
+        data = json.loads(FUTURES_UNIVERSE_FILE.read_text(encoding="utf-8"))
+        return [x for x in data if isinstance(x, dict) and isinstance(x.get("symbol"), str)]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def ingest_futures(deadline: float) -> tuple[int, int]:
+    """新浪主连灌底座 + 日常刷新：day 全历史单请求拉齐，m30 增量合并。
+
+    品种仅 ~70 个（1 请求/周期/品种），一次全量跑完（股票 universe 的 1.5%）。
+    - day: 全历史单请求拉齐 + merge（新浪主连无翻页概念，天然只增不减）
+    - m30: 与股票同款 merge_bars 增量合并（约 4 个月滚动窗口内只增不减）
+    - week/month: 由合并后日线本地推导
+    返回 (处理品种数, 失败数)。
+    """
+    universe = load_futures_universe()
+    if not universe:
+        print("futures universe missing/empty; skip", flush=True)
+        return 0, 0
+    (CACHE / "_futures_universe.json").write_text(
+        json.dumps(universe, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    ok, failed = 0, 0
+    for u in universe:
+        if time.monotonic() > deadline:
+            print(f"futures deadline reached; remaining {len(universe) - ok - failed} varieties next run", flush=True)
+            break
+        sym = u["symbol"]  # nf_RB0
+        raw = sym[3:]      # RB0
+        try:
+            day_bars = futures_daily.fetch_kline(raw, "day")
+            if day_bars:
+                merged = merge_bars(sym, "day", day_bars)
+                save_cache(sym, "day", merged, backfilled=True)
+                save_cache(sym, "week", derive_week_bars(merged))
+                save_cache(sym, "month", derive_month_bars(merged))
+            m30_bars = futures_daily.fetch_kline(raw, "m30")
+            if m30_bars:
+                save_cache(sym, "m30", merge_bars(sym, "m30", m30_bars))
+            if day_bars or m30_bars:
+                ok += 1
+                print(f"[futures] {sym} {u['name']} day={len(day_bars)} m30={len(m30_bars)}", flush=True)
+            else:
+                failed += 1
+                print(f"[futures] {sym} {u['name']} FAILED both day/m30", flush=True)
+        except Exception as exc:  # 单品种失败不阻塞其他品种
+            failed += 1
+            print(f"[futures] {sym} FAILED: {exc}", flush=True)
+        time.sleep(REQUEST_DELAY + random.random() * 0.2)
+    return ok, failed
+
+
 universe_set: set[str] = set()  # ingest_tdx_daily 引用，main() 里赋值
 
 
@@ -515,6 +572,12 @@ def main() -> int:
         tdx_cache = ROOT / args.tdx_cache_dir if args.tdx_cache_dir else None
         ingested, added = ingest_tdx_daily(universe, tdx_cache)
         print(f"tdx base ingested: {ingested} stocks, {added} new bars", flush=True)
+    # 期货主连（新浪）：~70 品种 day 全历史 + m30，分钟级完成；
+    # --skip-daily-weekly 的纯 m30 批次模式跳过（保持该模式语义纯粹）
+    if not args.skip_daily_weekly:
+        fut_deadline = PROCESS_STARTED + args.max_hours * 3600
+        fok, ffail = ingest_futures(fut_deadline)
+        print(f"futures ingested: {fok} varieties, {ffail} failed", flush=True)
     # 数据完整性策略：day/week/month/m30 全部增量合并（历史只增不减）。
     # week 由合并后的全历史日线聚合（口径统一、零请求）；month 由日线按自然月聚合，
     # 两者都随每次 day 刷新自动更新，无需单独请求。
