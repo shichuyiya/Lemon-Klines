@@ -311,8 +311,24 @@ def derive_month_bars(day_bars: list[dict]) -> list[dict]:
 
 
 def pack_snapshot(out: Path) -> str:
-    names = sorted(p.name for p in CACHE.iterdir() if p.name.endswith(".json.gz") or p.name == "_universe.json")
+    names = sorted(p.name for p in CACHE.iterdir() if p.name.endswith(".json.gz") or p.name in ("_universe.json", "_futures_universe.json"))
     if not names: raise RuntimeError("no cache files produced")
+    # 期货清单必须随期货K线一并发布，否则消费端无法显示品种中文名。
+    futures_files = [n for n in names if re.fullmatch(r"nf_[A-Z]{1,3}0\.(?:day|week|month|m30)\.json\.gz", n)]
+    if futures_files:
+        manifest = CACHE / "_futures_universe.json"
+        if "_futures_universe.json" not in names or not manifest.is_file():
+            raise RuntimeError("期货K线存在但 _futures_universe.json 缺失，拒绝发布不完整快照")
+        try:
+            universe = json.loads(manifest.read_text(encoding="utf-8"))
+            symbols = {str(x.get("symbol", "")) for x in universe if isinstance(x, dict)}
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"期货清单无法解析：{exc}") from exc
+        file_symbols = {n.split(".", 1)[0] for n in futures_files}
+        unknown = file_symbols - symbols
+        missing = symbols - file_symbols
+        if unknown or missing:
+            raise RuntimeError(f"期货清单与K线文件不一致：清单外={sorted(unknown)[:5]}，无K线={sorted(missing)[:5]}")
     files = [{"name": n, "size": (CACHE / n).stat().st_size} for n in names]
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     header = json.dumps({"date": date, "files": files}, separators=(",", ":")).encode()
