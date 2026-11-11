@@ -68,8 +68,9 @@ COOLDOWN_UNTIL = 0.0
 END_ANCHOR: dict[str, str] = {}
 QQ_HOSTS = ("web.ifzq.gtimg.cn", "ifzq.gtimg.cn")
 SNAPSHOT_MAGIC = b"LKSNAP1"
-# 股票: sh/sz/bj+6位数字；期货主连: nf_+品种缩写+0（如 nf_RB0，见 futures_universe.json）
-SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|month|m30|m60|m15|m5)\.json\.gz$|^_universe\.json$|^_futures_universe\.json$|^nf_[A-Z]{1,3}0\.(?:day|week|month|m30)\.json\.gz$")
+# 股票: sh/sz/bj+6位数字；期货主连: nf_+品种缩写+0（如 nf_RB0，见 futures_universe.json），
+# 分钟级周期 m1/m5/m15/m60 与 m30 同构（新浪 getFewMinLine，单请求 1023 根）
+SAFE_SNAPSHOT_NAME = re.compile(r"^(?:sh|sz|bj)\d{6}\.(?:day|week|month|m30|m60|m15|m5|m1)\.json\.gz$|^_universe\.json$|^_futures_universe\.json$|^nf_[A-Z]{1,3}0\.(?:day|week|month|m30|m60|m15|m5|m1)\.json\.gz$")
 # 日线/周线翻页单页上限：qfq 接口实测 count>640 无效（c=1023 只回 641 根），
 # end+count 可向历史翻页——全历史回填靠多页拼接。
 FQ_PAGE_COUNT = 640
@@ -497,11 +498,12 @@ def load_futures_universe() -> list[dict]:
 
 
 def ingest_futures(deadline: float) -> tuple[int, int]:
-    """新浪主连灌底座 + 日常刷新：day 全历史单请求拉齐，m30 增量合并。
+    """新浪主连灌底座 + 日常刷新：day 全历史单请求拉齐，分钟级周期增量合并。
 
-    品种仅 ~70 个（1 请求/周期/品种），一次全量跑完（股票 universe 的 1.5%）。
+    品种仅 ~70 个，day+m1/m5/m15/m30/m60 共 6 请求/品种 ≈ 420 请求，全量约 10-15 分钟。
     - day: 全历史单请求拉齐 + merge（新浪主连无翻页概念，天然只增不减）
-    - m30: 与股票同款 merge_bars 增量合并（约 4 个月滚动窗口内只增不减）
+    - m1/m5/m15/m30/m60: 与股票同款 merge_bars 增量合并（各自窗口内只增不减：
+      m1 约 3 个交易日、m5 约 3 周、m15 约 2.5 月、m30 约 4 月、m60 约 9 月）
     - week/month: 由合并后日线本地推导
     返回 (处理品种数, 失败数)。
     """
@@ -512,6 +514,7 @@ def ingest_futures(deadline: float) -> tuple[int, int]:
     (CACHE / "_futures_universe.json").write_text(
         json.dumps(universe, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     ok, failed = 0, 0
+    minute_periods = ("m1", "m5", "m15", "m30", "m60")
     for u in universe:
         if time.monotonic() > deadline:
             print(f"futures deadline reached; remaining {len(universe) - ok - failed} varieties next run", flush=True)
@@ -525,15 +528,20 @@ def ingest_futures(deadline: float) -> tuple[int, int]:
                 save_cache(sym, "day", merged, backfilled=True)
                 save_cache(sym, "week", derive_week_bars(merged))
                 save_cache(sym, "month", derive_month_bars(merged))
-            m30_bars = futures_daily.fetch_kline(raw, "m30")
-            if m30_bars:
-                save_cache(sym, "m30", merge_bars(sym, "m30", m30_bars))
-            if day_bars or m30_bars:
+            min_counts: dict[str, int] = {}
+            for mp in minute_periods:
+                bars = futures_daily.fetch_kline(raw, mp)
+                if bars:
+                    save_cache(sym, mp, merge_bars(sym, mp, bars))
+                min_counts[mp] = len(bars)
+            got_any = day_bars or any(min_counts.values())
+            if got_any:
                 ok += 1
-                print(f"[futures] {sym} {u['name']} day={len(day_bars)} m30={len(m30_bars)}", flush=True)
+                mins = " ".join(f"{k}={v}" for k, v in min_counts.items())
+                print(f"[futures] {sym} {u['name']} day={len(day_bars)} {mins}", flush=True)
             else:
                 failed += 1
-                print(f"[futures] {sym} {u['name']} FAILED both day/m30", flush=True)
+                print(f"[futures] {sym} {u['name']} FAILED all periods", flush=True)
         except Exception as exc:  # 单品种失败不阻塞其他品种
             failed += 1
             print(f"[futures] {sym} FAILED: {exc}", flush=True)
