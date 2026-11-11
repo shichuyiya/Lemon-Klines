@@ -2,8 +2,13 @@
 """新浪期货主连品种 K 线采集（快照仓库期货数据源）。
 
 数据源: InnerFuturesNewService（stock2.finance.sina.com.cn）
-- 日K:  getDailyKLine?symbol={VAR}0   上市首日起全历史，单请求全量返回（无翻页）
-- 30分: getFewMinLine?symbol={VAR}0&type=30   回溯约 4 个多月
+- 日K:   getDailyKLine?symbol={VAR}0            上市首日起全历史，单请求全量返回（无翻页）
+- 分钟级: getFewMinLine?symbol={VAR}0&type={N}  单请求上限 1023 根，覆盖夜盘：
+    type=1  约 3 个交易日（m1）
+    type=5  约 3 周（m5）
+    type=15 约 2.5 个月（m15）
+    type=30 约 4 个月（m30）
+    type=60 约 9 个月（m60）
 - 实时: hq.sinajs.cn/list=nf_{VAR}0（App 端实时行情前缀与快照符号一致）
 
 主连符号约定: {品种缩写}0 → 快照符号 nf_{VAR}0（如 nf_RB0 螺纹钢连续），
@@ -16,26 +21,32 @@ bar 字段: date/open/close/high/low/volume/amount
 """
 from __future__ import annotations
 
-import json
 import re
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Lemon-Light-kline-backfill/1.1"
 DAY_URL = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t=/InnerFuturesNewService.getDailyKLine?symbol={sym}"
-M30_URL = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t=/InnerFuturesNewService.getFewMinLine?symbol={sym}&type=30"
+MIN_URL = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t=/InnerFuturesNewService.getFewMinLine?symbol={sym}&type={n}"
+# 快照周期 → 新浪 getFewMinLine type；day 走 getDailyKLine 单列
+PERIOD_TYPE = {"m1": 1, "m5": 5, "m15": 15, "m30": 30, "m60": 60}
 # 品种缩写+0 主连；防注入白名单
 SYM_RE = re.compile(r"^[A-Z]{1,3}0$")
 BAR_RE = re.compile(r'\{"d":"([\d\- :]+)","o":"([\d.]+)","h":"([\d.]+)","l":"([\d.]+)","c":"([\d.]+)","v":"([\d.]+)"')
 
 
 def fetch_kline(sym: str, kind: str, retries: int = 3) -> list[dict]:
-    """拉取主连日K/30分钟线。kind: day | m30。失败重试，耗尽返回 []。"""
+    """拉取主连日K/分钟级K线。kind: day | m1 | m5 | m15 | m30 | m60。失败重试，耗尽返回 []。"""
     if not SYM_RE.fullmatch(sym):
         raise ValueError(f"bad futures symbol: {sym!r}")
-    url = (DAY_URL if kind == "day" else M30_URL).format(sym=sym)
+    if kind == "day":
+        url = DAY_URL.format(sym=sym)
+    else:
+        n = PERIOD_TYPE.get(kind)
+        if n is None:
+            raise ValueError(f"bad futures kind: {kind!r}")
+        url = MIN_URL.format(sym=sym, n=n)
     last: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
@@ -47,7 +58,7 @@ def fetch_kline(sym: str, kind: str, retries: int = 3) -> list[dict]:
             bars = []
             for m in BAR_RE.finditer(text):
                 d, o, h, l, c, v = m.groups()
-                if kind == "m30":
+                if kind != "day":
                     # '2026-06-30 22:00:00' → '2026-06-30 22:00'（与股票 m30 时刻格式对齐）
                     d = d[:16]
                 bars.append({"date": d, "open": float(o), "close": float(c),
