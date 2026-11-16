@@ -1,0 +1,114 @@
+name: Snapshot watchdog
+
+# 每日快照健康审查：与数据采集解耦的独立哨兵。
+# - 每天 UTC 14:00（北京 22:00，收盘后所有采集班次应已完成）跑一次，含周末
+# - 只查 GitHub API，不拉行情，1 分钟内完成
+# - 检查项：最新快照日期是否为最近交易日、期货清单与 K 线文件完整性、
+#   最近一次采集运行是否 success
+# - 任一检查失败 → step exit 1 → GitHub 向仓库关注者发失败邮件，肉眼可见
+
+on:
+  schedule:
+    - cron: '0 14 * * *'   # 北京每天 22:00（含周末，审查不依赖行情）
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Audit latest snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          from datetime import date, datetime, timedelta, timezone
+
+          REPO = os.environ["REPO"]
+          TOKEN = os.environ["GITHUB_TOKEN"]
+          BASE = f"https://api.github.com/repos/{REPO}"
+          H = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json",
+               "User-Agent": "lemon-snapshot-watchdog"}
+
+          def get(path):
+              req = urllib.request.Request(BASE + path, headers=H)
+              with urllib.request.urlopen(req, timeout=30) as res:
+                  return json.loads(res.read())
+
+          problems = []
+
+          # 1) 最新快照资产：日期应为最近一个交易日（周末顺延到周五）
+          rel = get("/releases/tags/kline-snapshot")
+          assets = sorted([a for a in rel.get("assets", []) if a["name"].endswith(".ksnap")],
+                          key=lambda a: a["name"], reverse=True)
+          if not assets:
+              problems.append("Release 里没有任何 .ksnap 快照资产")
+          else:
+              latest = assets[0]
+              m = re.fullmatch(r"kline-snapshot-(\d{8})\.ksnap", latest["name"])
+              snap_date = (datetime.strptime(m.group(1), "%Y%m%d").date() if m else None)
+              today = datetime.now(timezone.utc).date()
+              # 最近交易日：周末回退到周五
+              expect = today
+              while expect.weekday() >= 5:
+                  expect -= timedelta(days=1)
+              # 允许 1 天宽限（采集班次 17:30 北京，22:00 审查当天应已有）
+              stale_days = (expect - snap_date).days if snap_date else 999
+              print(f"最新快照: {latest['name']} ({latest['size']/1048576:.1f} MB)  期望交易日: {expect}")
+              if stale_days > 1:
+                  problems.append(f"快照过期：最新 {snap_date}，期望 {expect}（落后 {stale_days} 天）")
+
+              # 2) 快照头部：期货清单与 K 线完整性（Range 只拉头部 2MB）
+              req = urllib.request.Request(latest["url"], headers={**H, "Accept": "application/octet-stream",
+                                                                  "Range": "bytes=0-2097151"})
+              with urllib.request.urlopen(req, timeout=60) as res:
+                  head = res.read()
+              if head[:7] != b"LKSNAP1":
+                  problems.append("快照头部 magic 校验失败")
+              else:
+                  hlen = int.from_bytes(head[7:11], "little")
+                  header = json.loads(head[11:11 + hlen])
+                  names = [f["name"] for f in header["files"]]
+                  nf = [n for n in names if n.startswith("nf_")]
+                  has_manifest = "_futures_universe.json" in names
+                  periods = {}
+                  for n in nf:
+                      p = n.split(".")[1]
+                      periods[p] = periods.get(p, 0) + 1
+                  print(f"快照文件数: {len(names)}  期货文件: {len(nf)}  周期分布: {periods}")
+                  if not has_manifest:
+                      problems.append("快照缺少 _futures_universe.json（期货清单）")
+                  expect_periods = {"day", "week", "month", "m1", "m5", "m15", "m30", "m60"}
+                  got = {p for p, c in periods.items() if c > 0}
+                  missing = expect_periods - got
+                  if missing:
+                      problems.append(f"期货周期缺失: {sorted(missing)}")
+                  for p, c in periods.items():
+                      if c != 70:
+                          problems.append(f"期货周期 {p} 只有 {c}/70 个品种")
+
+          # 3) 最近一次采集运行结论
+          runs = get("/actions/workflows/kline-snapshot.yml/runs?per_page=3")["workflow_runs"]
+          last = runs[0] if runs else None
+          if last:
+              print(f"最近采集: run {last['id']} {last['event']} {last['conclusion'] or last['status']} @ {last['created_at']}")
+              if last["conclusion"] not in ("success",):
+                  # 允许 in_progress（正在跑）
+                  if last["status"] != "in_progress":
+                      problems.append(f"最近采集运行 conclusion={last['conclusion']}（run {last['id']}）")
+          else:
+              problems.append("没有任何采集运行记录")
+
+          if problems:
+              print("\n=== 审查发现问题 ===")
+              for p in problems:
+                  print(f"[FAIL] {p}")
+              raise SystemExit(1)
+          print("\n=== 审查通过：快照日期/期货完整性/采集状态 全部正常 ===")
+          PY
