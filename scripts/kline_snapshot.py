@@ -214,6 +214,8 @@ def save_cache(symbol: str, period: str, bars: list[dict], **extra) -> None:
     if len(sources) == 1 and None not in sources:
         source = next(iter(sources))
         payload["adjustment"] = {"schema": 2, "source": source.rsplit("-", 1)[0], "mode": "qfq" if source.endswith("-qfq") else "raw", "method": "full-history" if period == "day" else "verified-source"}
+        if not source.endswith("-qfq"):
+            payload["adjustment"]["status"]="quarantined"
     elif period in ("week", "month") and bars:
         day_meta = load_cache_meta(symbol, "day").get("adjustment")
         if day_meta:
