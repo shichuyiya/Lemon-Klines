@@ -143,31 +143,5 @@ def anchor_ratio(raw_bars: list[dict], qfq_bars: list[dict]) -> tuple[float, str
 
 
 def apply_anchor_qfq(raw_bars: list[dict], qfq_bars: list[dict]) -> list[dict]:
-    """前复权（锚定比值法，不依赖分红字段口径）：
-    - 重叠区（腾讯 qfq 覆盖的最近 ~640 根）直接用腾讯 qfq 价（天然前复权、含除权日当天）
-    - 重叠区之前的历史：原始价 × anchor_ratio（重叠区首日 qfq/原始 比值，
-      即"最近一次除权"的整体复权系数——更早的除权在原始价里本来就已反映，
-      前复权只需修正"基准日之后"的除权）
-    成交量/成交额不动（仅价格口径复权，量能用原始值）。
-    """
-    if not raw_bars: return []
-    if not qfq_bars: return raw_bars
-    qfq_map = {b["date"]: b for b in qfq_bars}
-    overlap_first = min(d for d in qfq_map if any(b["date"] == d for b in raw_bars)) \
-        if any(b["date"] in qfq_map for b in raw_bars) else ""
-    ratio = 1.0
-    if overlap_first:
-        raw0 = next(b for b in raw_bars if b["date"] == overlap_first)
-        q0 = qfq_map[overlap_first]
-        if raw0["close"] > 0: ratio = q0["close"] / raw0["close"]
-    out = []
-    for b in raw_bars:
-        q = qfq_map.get(b["date"])
-        if q is not None:
-            out.append({**b, "open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]})
-        elif ratio != 1.0:
-            out.append({**b, "open": round(b["open"] * ratio, 4), "high": round(b["high"] * ratio, 4),
-                        "low": round(b["low"] * ratio, 4), "close": round(b["close"] * ratio, 4)})
-        else:
-            out.append(b)
-    return out
+    """Deprecated: a single anchor cannot adjust multiple historical corporate actions."""
+    raise ValueError("单锚点复权已禁用：请完整重拉前复权历史，或使用完整除权事件链")

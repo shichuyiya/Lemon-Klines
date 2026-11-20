@@ -1,0 +1,6 @@
+__pycache__/
+.kline-cache/
+.adjustment-backup/
+repair-report.json
+unverified-files.json
+original/

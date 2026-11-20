@@ -39,7 +39,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import tdxlday  # 通达信官网日线包底座 + 前复权（锚定比值法）
+import repair_adjustment  # 完整同源前复权历史；禁止单锚点缩放原始历史
 import futures_daily  # 新浪期货主连品种 K 线（day 全历史 + m30）
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +147,8 @@ def save_universe(symbols: list[str]) -> None:
 
 
 def fetch(symbol: str, period: str, limit: int) -> list[dict]:
+    if period == "day":
+        return repair_adjustment.full_daily(symbol)
     # 等待全局冷却结束（限流窗口期间所有 worker 同步暂停）+ 常规请求间隔
     while True:
         with COOLDOWN_LOCK:
@@ -156,6 +158,10 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
     time.sleep(max(0.0, REQUEST_DELAY) + random.random() * 0.2)
     market, code = symbol[:2], symbol[2:]
     if period == "m30":
+        try:
+            return repair_adjustment.request(symbol, "m30")
+        except Exception:
+            pass
         # 5 段 param（留空 start/end）才能拿到服务器最大深度 482 根；4 段只给 320。
         # count 传大值由服务器截断，等于每次拉满。
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/kline/mkline?"
@@ -176,7 +182,7 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
             try:
                 out.append({"date": f"{p[0][:4]}-{p[0][4:6]}-{p[0][6:8]} {p[0][8:10]}:{p[0][10:12]}",
                             "open": float(p[1]), "close": float(p[2]), "high": float(p[3]),
-                            "low": float(p[4]), "volume": float(p[5]), "amount": 0.0})
+                            "low": float(p[4]), "volume": float(p[5]), "amount": 0.0, "priceSource": "tencent-raw"})
             except (ValueError, IndexError):
                 continue
         return out
@@ -202,6 +208,15 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
 def save_cache(symbol: str, period: str, bars: list[dict], **extra) -> None:
     CACHE.mkdir(parents=True, exist_ok=True)
     payload = {"symbol": symbol, "tf": period, "bars": bars, "updatedAt": int(time.time() * 1000)}
+    sources = {b.get("priceSource") for b in bars}
+    if len(sources) == 1 and None not in sources:
+        source = next(iter(sources))
+        payload["adjustment"] = {"schema": 2, "source": source.rsplit("-", 1)[0], "mode": "qfq" if source.endswith("-qfq") else "raw", "method": "full-history" if period == "day" else "verified-source"}
+    elif period in ("week", "month") and bars:
+        day_meta = load_cache_meta(symbol, "day").get("adjustment")
+        if day_meta:
+            payload["adjustment"] = day_meta
+
     payload.update(extra)
     (CACHE / f"{symbol}.{period}.json.gz").write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode()))
 
@@ -227,10 +242,25 @@ def merge_bars(symbol: str, period: str, fresh: list[dict]) -> list[dict]:
     滚动丢历史。旧文件 + 新拉取按 date 去重（新值优先），按时间排序后整体保留。"""
     if not fresh: return load_cache_bars(symbol, period)
     old = load_cache_bars(symbol, period)
-    if not old: return fresh
-    merged = {b["date"]: b for b in old}
-    merged.update({b["date"]: b for b in fresh})
-    return [merged[k] for k in sorted(merged)]
+    if period == "day":
+        dates = {b["date"] for b in fresh}
+        if old and not all(b["date"] in dates for b in old):
+            raise ValueError("完整日线重建缺失旧历史日期，拒绝覆盖")
+        return fresh
+    if not old:return fresh
+    fresh_dates = {b["date"] for b in fresh}
+    if all(b["date"] in fresh_dates for b in old):return fresh
+    old_source = {b.get("priceSource") for b in old}
+    new_source = {b.get("priceSource") for b in fresh}
+    if old_source != new_source or None in old_source or len(old_source) != 1:
+        raise ValueError("分钟历史来源或复权口径未验证，保留隔离文件，禁止混合拼接")
+    by_date = {b["date"]: b for b in old}
+    for b in fresh:
+        previous = by_date.get(b["date"])
+        if previous and b["date"] != old[-1]["date"] and not repair_adjustment.matches(previous, b, .0011):
+            raise ValueError("分钟历史复权基准改变，必须重新验证历史")
+        by_date[b["date"]] = b
+    return [by_date[k] for k in sorted(by_date)]
 
 
 # 兼容旧名
@@ -247,34 +277,7 @@ def is_etf_symbol(symbol: str) -> bool:
 def dayback(symbol: str) -> tuple[list[dict], bool]:
     """全历史回填：从快照已有最早日线的前一天起，用 end+count 向历史翻页，
     直到服务器返回尽头（页不足或空）。返回 (合并后全部日线, 是否触底)。"""
-    existing = load_cache_bars(symbol, "day")
-    if not existing:
-        # 快照没有该股日线：先拉最新一段作为起点
-        END_ANCHOR[symbol] = ""
-        latest = fetch(symbol, "day", PERIODS["day"][1])
-        if not latest: return [], False
-        existing = latest
-    oldest = min(b["date"] for b in existing)
-    all_bars: dict[str, dict] = {b["date"]: b for b in existing}
-    touched_bottom = False
-    pages = 0
-    while not touched_bottom and pages < 60:  # 60 页 × 640 根远超任何 A 股历史（平安 1991 上市约 8600 根）
-        END_ANCHOR[symbol] = oldest
-        try:
-            page = fetch(symbol, "day", FQ_PAGE_COUNT)
-        finally:
-            END_ANCHOR.pop(symbol, None)
-        fresh = [b for b in page if b["date"] < oldest]
-        for b in fresh:
-            all_bars.setdefault(b["date"], b)
-        if not fresh or len(page) < FQ_PAGE_COUNT:
-            touched_bottom = True  # 服务器翻过上市首日
-            break
-        oldest = min(b["date"] for b in fresh)
-        pages += 1
-        time.sleep(max(0.0, REQUEST_DELAY) + random.random() * 0.2)
-    merged = [all_bars[k] for k in sorted(all_bars)]
-    return merged, touched_bottom
+    return repair_adjustment.full_daily(symbol), True
 
 
 def derive_week_bars(day_bars: list[dict]) -> list[dict]:
@@ -338,6 +341,14 @@ def pack_snapshot(out: Path) -> str:
         missing = symbols - file_symbols
         if unknown or missing:
             raise RuntimeError(f"期货清单与K线文件不一致：清单外={sorted(unknown)[:5]}，无K线={sorted(missing)[:5]}")
+    unverified=[]
+    for n in names:
+        if re.match(r"^(sh|sz|bj)\d{6}\.", n):
+            data=json.loads(gzip.decompress((CACHE/n).read_bytes()))
+            basis=data.get("adjustment", {})
+            if basis.get("schema")!=2 or basis.get("mode")!="qfq" or basis.get("status")=="quarantined":unverified.append(n)
+    if unverified:
+        raise RuntimeError(f"拒绝发布含未验证复权历史的快照: {len(unverified)} files, e.g. {unverified[:5]}")
     files = [{"name": n, "size": (CACHE / n).stat().st_size} for n in names]
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     header = json.dumps({"date": date, "files": files}, separators=(",", ":")).encode()
@@ -438,68 +449,8 @@ def publish(snapshot: Path, repo: str, token: str, keep: int) -> None:
         for old in assets[keep:]: gh("DELETE", f"{base}/releases/assets/{old['id']}", token)
 
 
-def ingest_tdx_daily(universe: list[str], cache_dir: Path | None = None) -> tuple[int, int]:
-    """通达信官网日线包灌底座：全历史原始价 + 锚定比值前复权。
-
-    对 universe 中每只**股票**（ETF 除外，见 is_etf_symbol）：
-    - 官网 .day 原始全历史为骨架（QFQ_COVER 覆盖区内已有腾讯 qfq 的除外）
-    - 快照里已有的腾讯 qfq 日线（最近 ~640 根，天然前复权）优先级更高——
-      重叠区直接采用；更早历史 × (重叠首日 qfq收/原始收) 比值
-    - 结果与快照旧文件 merge 后落盘，全历史只增不减
-
-    ETF/LOF 必须绕过官网包底座：官网 .day 是原始价口径（基金份额拆分/分红
-    未折算，实测 588710 拆分日 C=31.6→11.14 断崖），而锚定比值法只有"最近
-    一次事件"的因子，会留下未修正的旧事件跳变。ETF 走纯腾讯 qfq 路径
-    （qfq 全序列折算，上市初 0.333 与现价连续，与通达信/同花顺展示一致）。
-    返回 (灌入股票数, 新增 bar 总数)。
-    """
-    stock_universe = [s for s in universe if not is_etf_symbol(s)]
-    zips: dict[str, Path] = {}
-    for mkt in ("sh", "sz", "bj"):
-        syms = [s for s in stock_universe if s.startswith(mkt)]
-        if not syms: continue
-        dest = (cache_dir / f"{mkt}lday.zip") if cache_dir else ROOT / f".tdx-{mkt}lday.zip"
-        try:
-            zips[mkt] = tdxlday.download_zip(mkt, dest)
-        except Exception as exc:  # 下载/校验失败回退腾讯翻页，不阻塞快照发布
-            print(f"tdx {mkt}lday.zip download failed: {exc} — fallback to tencent pages", flush=True)
-    if not zips:
-        return 0, 0
-    total_new = 0
-    ingested = 0
-    for mkt, zp in zips.items():
-        try:
-            parsed = tdxlday.parse_lday_zip(zp, mkt)
-        except Exception as exc:  # zip 二次损坏（如磁盘满/半写）跳过该市场
-            print(f"tdx {mkt}lday parse failed: {exc} — skip this market", flush=True)
-            continue
-        print(f"tdx {mkt}lday parsed: {len(parsed)} stocks", flush=True)
-        for sym, raw_bars in parsed.items():
-            if sym not in universe_set: continue
-            old = load_cache_bars(sym, "day")
-            qfq_cover = {b["date"]: b for b in old}  # 快照现有 = 腾讯 qfq（天然前复权）
-            merged_map = {b["date"]: b for b in old}
-            # 历史段：不在 qfq 覆盖区内的原始价 × 锚定比值
-            ratio = tdxlday.anchor_ratio(raw_bars, list(qfq_cover.values()))[0] if qfq_cover else 1.0
-            for b in raw_bars:
-                if b["date"] in qfq_cover:
-                    continue  # qfq 覆盖区优先，不动
-                if ratio != 1.0:
-                    b = {**b, "open": round(b["open"] * ratio, 4), "high": round(b["high"] * ratio, 4),
-                         "low": round(b["low"] * ratio, 4), "close": round(b["close"] * ratio, 4)}
-                if b["date"] not in merged_map:
-                    merged_map[b["date"]] = b
-                    total_new += 1
-            merged = [merged_map[k] for k in sorted(merged_map)]
-            meta = load_cache_meta(sym, "day")
-            backfilled = bool(meta.get("backfilled"))
-            if merged and merged[0]["date"] <= min(b["date"] for b in raw_bars):
-                backfilled = True  # 历史已触达官网包起点（上市首日），不再需要 dayback 翻页
-            save_cache(sym, "day", merged, backfilled=backfilled)
-            save_cache(sym, "week", derive_week_bars(merged))
-            save_cache(sym, "month", derive_month_bars(merged))
-            ingested += 1
-    return ingested, total_new
+def ingest_tdx_daily(*args, **kwargs):
+    raise RuntimeError("原始历史单锚点复权已禁用，必须完整重拉同源前复权日线")
 
 
 def load_futures_universe() -> list[dict]:
@@ -603,13 +554,15 @@ def main() -> int:
     if not universe: raise RuntimeError("no symbols; add symbols to scripts/symbols.txt or use --all-a-shares")
     universe_set.clear()
     universe_set.update(universe)
-    # 通达信官网包灌底座：一次下载拿到全市场全历史原始价（不复权），
-    # 与快照内腾讯 qfq 锚定合并 → 全历史前复权，day 翻页回填（dayback）就此退役。
-    # 下载失败自动回退现有腾讯逐股路径，不影响本次运行。
-    if not args.skip_daily_weekly:
-        tdx_cache = ROOT / args.tdx_cache_dir if args.tdx_cache_dir else None
-        ingested, added = ingest_tdx_daily(universe, tdx_cache)
-        print(f"tdx base ingested: {ingested} stocks, {added} new bars", flush=True)
+    # Legacy snapshot bars have no trustworthy source/basis; quarantine until rebuilt.
+    for path in CACHE.glob("*.json.gz"):
+        if not re.match(r"^(sh|sz|bj)\d{6}\.", path.name):
+            continue
+        data = json.loads(gzip.decompress(path.read_bytes()))
+        if data.get("adjustment", {}).get("schema") != 2:
+            data["adjustment"] = {"schema": 2, "source": "legacy", "mode": "unknown", "status": "quarantined"}
+            data["updatedAt"] = 0
+            path.write_bytes(gzip.compress(json.dumps(data, separators=(",", ":")).encode()))
     # 期货主连（新浪）：~70 品种 day 全历史 + m30，分钟级完成；
     # --skip-daily-weekly 的纯 m30 批次模式跳过（保持该模式语义纯粹）
     if not args.skip_daily_weekly:
@@ -719,11 +672,18 @@ def main() -> int:
             if k == "backfill":
                 # 回填结果整体落盘（dayback 内部已合并旧数据），并打触底标记
                 save_cache(s, "day", bars, backfilled=complete)
-                if bars: save_cache(s, "week", derive_week_bars(bars))
+                if bars:
+                    save_cache(s, "week", derive_week_bars(bars))
+                    save_cache(s, "month", derive_month_bars(bars))
                 print(f"[{i}/{len(futures)}] {s} backfill {len(bars)} bottom={complete}", flush=True)
                 continue
             if bars:
-                bars = merge_bars(s, k, bars)  # 增量合并，历史只增不减
+                try:
+                    bars = merge_bars(s, k, bars)
+                except ValueError as exc:
+                    failures.append(f"{s} {k}: {exc}")
+                    print(f"[{i}/{len(futures)}] QUARANTINED {s} {k}: {exc}", flush=True)
+                    continue
                 save_cache(s, k, bars, **({"backfilled": True} if k == "day" and complete and len(bars) >= FQ_PAGE_COUNT else {}))
                 if k == "day":
                     save_cache(s, "week", derive_week_bars(bars))
