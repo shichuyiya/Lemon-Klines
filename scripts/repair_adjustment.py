@@ -96,7 +96,9 @@ def matches(a,b,tol):return all(abs(a[k]-b[k])<=tol for k in FIELDS)
 def transform(raw,adjusted,tol):
     # Recover the provider's per-session affine transform, checking all four prices.
     spread=raw['high']-raw['low']
-    if spread<=tol:return None
+    if spread<=tol:
+        if max(adjusted[k] for k in FIELDS)-min(adjusted[k] for k in FIELDS)<=tol:return 1.0,adjusted['close']-raw['close']
+        return None
     scale=(adjusted['high']-adjusted['low'])/spread
     offset=adjusted['low']-scale*raw['low']
     if scale<=0 or not matches({k:raw[k]*scale+offset for k in FIELDS},adjusted,tol):return None
@@ -108,7 +110,7 @@ def session_matches(rows, daily, tf, tol):
     anchors=[]
     if rows[-1]['date'].endswith('15:00'):anchors.append(abs(rows[-1]['close']-daily['close'])<=tol)
     opening={'m1':'09:31','m5':'09:35','m15':'09:45','m30':'10:00','m60':'10:30'}[tf]
-    if rows[0]['date'].endswith(opening):anchors.append(abs(rows[0]['open']-daily['open'])<=tol)
+    if rows[0]['date'].endswith(opening) or (tf=='m1' and rows[0]['date'].endswith('09:30')):anchors.append(abs(rows[0]['open']-daily['open'])<=tol)
     return bool(anchors) and all(anchors)
 
 def repair_minutes(old, fresh, daily, raw, tf):
@@ -124,6 +126,9 @@ def repair_minutes(old, fresh, daily, raw, tf):
     # Use fresh data only where it covers every legacy timestamp for that session.
     for date,rows in sorted(groups.items()):
         rows=sorted(rows,key=lambda b:b['date']);new=new_by_day.get(date,[])
+        # Some minute feeds exclude the opening auction from high/low despite carrying its open.
+        # The OHLC hull uses only recorded trade prices; never synthesize a price outside them.
+        rows=[{**b,'high':max(b['high'],b['open'],b['close']),'low':min(b['low'],b['open'],b['close'])} for b in rows]
         if new and {b['date'] for b in rows}<={b['date'] for b in new}:
             out.extend(new);new_by_day.pop(date,None);continue
         q=target.get(date);r=unadjusted.get(date)

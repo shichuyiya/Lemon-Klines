@@ -44,4 +44,10 @@ class AdjustmentTests(unittest.TestCase):
     def test_expired_budget_stops_new_pagination(self):
         with patch.object(repair,'DEADLINE',1):
             with self.assertRaises(TimeoutError):repair.tencent_full('sh600641')
+    def test_flat_limit_session_and_opening_auction(self):
+        r=bar('2026-07-28',31.04,31.04,31.04,31.04)
+        q=bar('2026-07-28',30,30,30,30)
+        self.assertEqual(repair.transform(r,q,.025),(1.0,-1.0399999999999991))
+        minute=bar('2026-07-28 09:30',30,30,30,30)
+        self.assertTrue(repair.session_matches([minute],q,'m1',.0025))
 if __name__=='__main__':unittest.main()
