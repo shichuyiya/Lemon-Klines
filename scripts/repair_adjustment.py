@@ -113,7 +113,7 @@ def session_matches(rows, daily, tf, tol):
     if rows[0]['date'].endswith(opening) or (tf=='m1' and rows[0]['date'].endswith('09:30')):anchors.append(abs(rows[0]['open']-daily['open'])<=tol)
     return bool(anchors) and all(anchors)
 
-def repair_minutes(old, fresh, daily, raw, tf):
+def repair_minutes(old, fresh, daily, raw, tf, tick=.01):
     """Only transform a complete legacy session whose OHLC matches verified raw daily OHLC.
     Partial/unverifiable sessions are retained in backup, never silently fabricated or dropped.
     """
@@ -133,7 +133,7 @@ def repair_minutes(old, fresh, daily, raw, tf):
             out.extend(new);new_by_day.pop(date,None);continue
         q=target.get(date);r=unadjusted.get(date)
         # Daily quotes are rounded to 2 decimals for shares and 3 decimals for ETFs.
-        tol=.025 if q and max(abs(q[k]) for k in FIELDS)>=5 else .0025
+        tol=2.5*tick
         end=rows[-1]['date'][-5:];start=rows[0]['date'][-5:]
         expected={'m1':240,'m5':48,'m15':16,'m30':8,'m60':4}[tf]
         complete=end=='15:00' and len(rows)==expected and start=={'m1':'09:31','m5':'09:35','m15':'09:45','m30':'10:00','m60':'10:30'}[tf]
@@ -142,7 +142,7 @@ def repair_minutes(old, fresh, daily, raw, tf):
         tr=transform(r,q,tol) if q and r and session_matches(rows,r,tf,tol) else None
         if tr:
             scale,offset=tr
-            out.extend([{**b,**{k:round(b[k]*scale+offset,6) for k in FIELDS}} for b in rows]);fixed+=1
+            out.extend([{**b,**{k:round(b[k]*scale+offset,3 if tick==.001 else 2) for k in FIELDS}} for b in rows]);fixed+=1
         else:unverified.append(date)
     for new in new_by_day.values():out.extend(new)
     return sorted({b['date']:b for b in out}.values(),key=lambda b:b['date']),fixed,unverified
@@ -184,7 +184,8 @@ def repair_symbol(symbol,cache,backup):
         try:
             try:fresh=request(symbol,tf)
             except Exception:fresh=[]
-            bars,fixed,unknown=repair_minutes(old[tf]['bars'],fresh,daily,raw,tf)
+            tick=.001 if symbol.startswith('sh5') or symbol.startswith(('sz15','sz16','sz18')) else .01
+            bars,fixed,unknown=repair_minutes(old[tf]['bars'],fresh,daily,raw,tf,tick)
             # Keep unverified files quarantined as a whole; no unnoticed history loss.
             if unknown:
                 stages[tf]=(old[tf]['bars'],dict(schema=SCHEMA,source='legacy',mode='unknown',status='quarantined',unverifiedDates=unknown))

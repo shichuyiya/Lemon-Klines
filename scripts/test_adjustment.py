@@ -17,8 +17,8 @@ class AdjustmentTests(unittest.TestCase):
         raw=bar('2026-08-14',3,3.16,3.2,2.9,'eastmoney-raw')
         q=bar('2026-08-14',1,3.16/3,3.2/3,2.9/3)
         minute=bar('2026-08-14 15:00',3.1,3.16,3.18,3.08,'tencent-raw')
-        fixed,n,unknown=repair.repair_minutes([minute],[],[q],[raw],'m30')
-        self.assertEqual(unknown,[]);self.assertEqual(n,1);self.assertAlmostEqual(fixed[0]['close'],1.053333,places=6)
+        fixed,n,unknown=repair.repair_minutes([minute],[],[q],[raw],'m30',.001)
+        self.assertEqual(unknown,[]);self.assertEqual(n,1);self.assertAlmostEqual(fixed[0]['close'],1.053,places=3)
         self.assertEqual(fixed[0]['volume'],100)
     def test_unverifiable_session_is_reported(self):
         q=bar('2026-08-14');r=bar('2026-08-14',30,33,36,27)
@@ -88,4 +88,21 @@ class AdjustmentTests(unittest.TestCase):
                 result=repair.repair_symbol('sh600641',cache,backup)
             self.assertEqual(result['dailyBars'],1)
             self.assertTrue((backup/'sh600641.m30.json.gz').exists())
+    def test_low_priced_share_uses_share_tick_not_etf_tick(self):
+        raw=bar('2026-07-20',4.97,4.86,5.10,4.75)
+        q=bar('2026-07-20',4.51,4.43,4.60,4.35)
+        minute=bar('2026-07-20 15:00',4.81,4.86,4.86,4.75)
+        fixed,_,unknown=repair.repair_minutes([minute],[],[q],[raw],'m30',.01)
+        self.assertEqual(unknown,[]);self.assertAlmostEqual(fixed[0]['close'],4.43,places=2)
+    def test_repeated_quarantine_keeps_intermediate_history(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(snapshot,'CACHE',Path(d)):
+            prior={'bars':[bar('2026-11-17')]}
+            current={'bars':[bar('2026-11-19')],'quarantinedHistory':prior}
+            p=Path(d)/'sh600641.day.json.gz'
+            p.write_bytes(gzip.compress(json.dumps(current).encode()))
+            snapshot.QUARANTINED_HISTORY[('sh600641','day')]=current
+            snapshot.save_cache('sh600641','day',[bar('2026-11-20')])
+            saved=json.loads(gzip.decompress(p.read_bytes()))
+            self.assertEqual(saved['quarantinedHistory']['bars'][0]['date'],'2026-11-19')
+            self.assertEqual(saved['quarantinedHistory']['quarantinedHistory']['bars'][0]['date'],'2026-11-17')
 if __name__=='__main__':unittest.main()

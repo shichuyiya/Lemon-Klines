@@ -223,7 +223,7 @@ def save_cache(symbol: str, period: str, bars: list[dict], **extra) -> None:
 
     previous = load_cache_meta(symbol,period)
     quarantine = QUARANTINED_HISTORY.pop((symbol,period), None)
-    archived = previous.get("quarantinedHistory") or quarantine
+    archived = quarantine or previous.get("quarantinedHistory")
     if archived:
         payload["quarantinedHistory"] = archived
         if "adjustment" in payload:payload["adjustment"]["historyStatus"]="partial"
@@ -479,27 +479,31 @@ def publish(snapshot: Path, repo: str, token: str, keep: int) -> None:
         release = json.loads(raw)
     else: raise RuntimeError(f"read release failed: HTTP {status} {raw[:300]!r}")
     name = f"kline-snapshot-{datetime.now(timezone.utc).strftime('%Y%m%d')}.ksnap"
-    previous = next((a for a in release.get("assets",[]) if a.get("name")==name),None)
-    staging = f"{name}.upload-{time.time_ns()}"
-    upload = f"https://uploads.github.com/repos/{repo}/releases/{release['id']}/assets?name={urllib.parse.quote(staging)}"
+    previous = next((a for a in release.get("assets", []) if a.get("name") == name), None)
+    staging_name = f"{name}.upload-{time.time_ns()}"
+    upload = f"https://uploads.github.com/repos/{repo}/releases/{release['id']}/assets?name={urllib.parse.quote(staging_name)}"
     status, raw = gh("POST", upload, token, snapshot.read_bytes(), "application/octet-stream")
-    if status != 201:raise RuntimeError(f"upload failed; previous snapshot retained: HTTP {status}")
-    staged=json.loads(raw)
-    if staged.get("size") != snapshot.stat().st_size:raise RuntimeError("uploaded snapshot size mismatch; previous snapshot retained")
+    if status != 201: raise RuntimeError(f"upload failed; previous snapshot retained: HTTP {status}")
+    staged = json.loads(raw)
+    if staged.get("size") != snapshot.stat().st_size:
+        raise RuntimeError("uploaded snapshot size mismatch; previous snapshot retained")
     if previous:
-        backup_name=f"{name}.previous-{time.time_ns()}"
-        status,raw=gh("PATCH",f"{base}/releases/assets/{previous['id']}",token,json.dumps({"name":backup_name}).encode())
-        if status!=200:raise RuntimeError("cannot stage previous snapshot; original retained")
-    status,raw=gh("PATCH",f"{base}/releases/assets/{staged['id']}",token,json.dumps({"name":name}).encode())
-    if status!=200:
-        if previous:gh("PATCH",f"{base}/releases/assets/{previous['id']}",token,json.dumps({"name":name}).encode())
-        raise RuntimeError("snapshot promotion failed; attempted to restore previous name")
-    # Only a completely uploaded, promoted version permits pruning the previous asset.
-    if previous:gh("DELETE",f"{base}/releases/assets/{previous['id']}",token)
+        backup_name = f"{name}.previous-{time.time_ns()}"
+        status, raw = gh("PATCH", f"{base}/releases/assets/{previous['id']}", token, json.dumps({"name": backup_name}).encode())
+        if status != 200: raise RuntimeError("cannot stage previous snapshot; original retained")
+    status, raw = gh("PATCH", f"{base}/releases/assets/{staged['id']}", token, json.dumps({"name": name}).encode())
+    if status != 200:
+        if previous:
+            rollback, _ = gh("PATCH", f"{base}/releases/assets/{previous['id']}", token, json.dumps({"name": name}).encode())
+            if rollback != 200:
+                raise RuntimeError(f"promotion and rollback failed; original asset {previous['id']} retained as {backup_name}")
+        raise RuntimeError("snapshot promotion failed; previous snapshot restored")
+    if previous: gh("DELETE", f"{base}/releases/assets/{previous['id']}", token)
     status, raw = gh("GET", f"{base}/releases/tags/kline-snapshot", token)
     if status == 200:
-        assets = sorted((a for a in json.loads(raw).get("assets", []) if re.fullmatch(r"kline-snapshot-\d{8}\.ksnap",a.get("name",""))),key=lambda a:a["name"],reverse=True)
-        for old in assets[keep:]:gh("DELETE",f"{base}/releases/assets/{old['id']}",token)
+        assets = sorted((a for a in json.loads(raw).get("assets", []) if re.fullmatch(r"kline-snapshot-\d{8}\.ksnap", a.get("name", ""))), key=lambda a: a["name"], reverse=True)
+        for old in assets[max(1, keep):]: gh("DELETE", f"{base}/releases/assets/{old['id']}", token)
+
 
 
 def ingest_tdx_daily(*args, **kwargs):

@@ -20,7 +20,7 @@ jobs:
           restore-keys: |
             kline-progress-
       - name: Test adjustment validation
-        run: python3 -m unittest discover -s scripts -p 'test_adjustment.py'
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Restore and preserve original snapshot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
