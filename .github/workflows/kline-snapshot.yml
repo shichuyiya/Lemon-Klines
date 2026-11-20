@@ -81,3 +81,12 @@ jobs:
               --workers 2 --delay 0.8 --m30-refresh 200 --keep 7 --max-hours 4 \
               --tdx-cache-dir .tdx-cache
           fi
+
+      - name: Keep freshness and history coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-quality-${{ github.run_id }}
+          path: snapshot-quality.json
+          if-no-files-found: ignore
+          retention-days: 14

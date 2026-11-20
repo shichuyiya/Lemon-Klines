@@ -35,7 +35,19 @@ class AdjustmentTests(unittest.TestCase):
     def test_full_daily_replaces_old_prices(self):
         with patch.object(snapshot,'load_cache_bars',return_value=[bar('d1',30,31,32,29)]):
             self.assertEqual(snapshot.merge_bars('sh600641','day',[bar('d1')])[0]['close'],11)
-    def test_daily_replacement_cannot_drop_dates(self):
-        with patch.object(snapshot,'load_cache_bars',return_value=[bar('d1'),bar('d2')]):
-            with self.assertRaises(ValueError):snapshot.merge_bars('sh600641','day',[bar('d2')])
+    def test_daily_refresh_preserves_unverified_history_separately(self):
+        old=[bar('d1'),bar('d2')]
+        with patch.object(snapshot,'load_cache_bars',return_value=old),patch.object(snapshot,'load_cache_meta',return_value={'bars':old}):
+            fresh=snapshot.merge_bars('sh600641','day',[bar('d2')])
+            self.assertEqual(len(fresh),1)
+            self.assertEqual(snapshot.QUARANTINED_HISTORY.pop(('sh600641','day'))['bars'],old)
+    def test_expired_budget_stops_new_pagination(self):
+        with patch.object(repair,'DEADLINE',1):
+            with self.assertRaises(TimeoutError):repair.tencent_full('sh600641')
+    def test_flat_limit_session_and_opening_auction(self):
+        r=bar('2026-07-28',31.04,31.04,31.04,31.04)
+        q=bar('2026-07-28',30,30,30,30)
+        self.assertEqual(repair.transform(r,q,.025),(1.0,-1.0399999999999991))
+        minute=bar('2026-07-28 09:30',30,30,30,30)
+        self.assertTrue(repair.session_matches([minute],q,'m1',.0025))
 if __name__=='__main__':unittest.main()

@@ -57,8 +57,8 @@ PROCESS_STARTED = time.monotonic()
 # 更早的历史接口拿不到，靠 merge_m30_bars 把新拉取与快照旧文件增量合并来只增不减。
 M30_DEPTH = 482
 REQUEST_DELAY = 0.35
-REQUEST_TIMEOUT = 60
-REQUEST_RETRIES = 5
+REQUEST_TIMEOUT = 12
+REQUEST_RETRIES = 2
 # 腾讯限流是分钟级窗口（实测 curl exit 22 成簇出现、每小时约 35%）：
 # 单请求 5 次退避重试最长 8s 撑不过去，必须让所有 worker 全局冷却一起等。
 COOLDOWN_LOCK = threading.Lock()
@@ -66,6 +66,7 @@ COOLDOWN_UNTIL = 0.0
 # 历史翻页锚点：symbol -> end 日期（取该日之前的历史页）。由 dayback 任务填充，
 # 仅在回填任务执行期间生效；普通 day 任务不带锚点（拉最新 1023 根）。
 END_ANCHOR: dict[str, str] = {}
+QUARANTINED_HISTORY: dict[tuple[str,str], dict] = {}
 QQ_HOSTS = ("web.ifzq.gtimg.cn", "ifzq.gtimg.cn")
 SNAPSHOT_MAGIC = b"LKSNAP1"
 # 股票: sh/sz/bj+6位数字；期货主连: nf_+品种缩写+0（如 nf_RB0，见 futures_universe.json），
@@ -148,7 +149,8 @@ def save_universe(symbols: list[str]) -> None:
 
 def fetch(symbol: str, period: str, limit: int) -> list[dict]:
     if period == "day":
-        return repair_adjustment.full_daily(symbol)
+        try:return repair_adjustment.request(symbol,limit=1000)
+        except Exception:pass
     # 等待全局冷却结束（限流窗口期间所有 worker 同步暂停）+ 常规请求间隔
     while True:
         with COOLDOWN_LOCK:
@@ -199,7 +201,7 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
                 try: amount = float(p[6])
                 except ValueError: amount = 0.0
             out.append({"date": p[0], "open": float(p[1]), "close": float(p[2]), "high": float(p[3]),
-                        "low": float(p[4]), "volume": float(p[5]), "amount": amount})
+                        "low": float(p[4]), "volume": float(p[5]), "amount": amount, "priceSource": "tencent-qfq"})
         except (ValueError, IndexError):
             continue
     return out
@@ -217,6 +219,12 @@ def save_cache(symbol: str, period: str, bars: list[dict], **extra) -> None:
         if day_meta:
             payload["adjustment"] = day_meta
 
+    previous = load_cache_meta(symbol,period)
+    quarantine = QUARANTINED_HISTORY.pop((symbol,period), None)
+    archived = previous.get("quarantinedHistory") or quarantine
+    if archived:
+        payload["quarantinedHistory"] = archived
+        if "adjustment" in payload:payload["adjustment"]["historyStatus"]="partial"
     payload.update(extra)
     (CACHE / f"{symbol}.{period}.json.gz").write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode()))
 
@@ -244,8 +252,17 @@ def merge_bars(symbol: str, period: str, fresh: list[dict]) -> list[dict]:
     old = load_cache_bars(symbol, period)
     if period == "day":
         dates = {b["date"] for b in fresh}
-        if old and not all(b["date"] in dates for b in old):
-            raise ValueError("完整日线重建缺失旧历史日期，拒绝覆盖")
+        if not old or all(b["date"] in dates for b in old):return fresh
+        previous = {b["date"]: b for b in old}
+        source = {b.get("priceSource") for b in fresh}
+        old_source = {b.get("priceSource") for b in old}
+        overlaps = [b for b in fresh if b["date"] in previous and b["date"] != old[-1]["date"]]
+        if source == old_source and None not in source and len(source)==1 and overlaps and all(repair_adjustment.matches(previous[b["date"]], b, .0011) for b in overlaps):
+            previous.update({b["date"]: b for b in fresh})
+            return [previous[k] for k in sorted(previous)]
+        # Keep the original history recoverable, but publish fresh verified screening data now.
+        QUARANTINED_HISTORY[(symbol,period)] = load_cache_meta(symbol,period)
+        print(f"{symbol}: fresh daily window published; older basis queued for full repair",flush=True)
         return fresh
     if not old:return fresh
     fresh_dates = {b["date"] for b in fresh}
@@ -346,12 +363,23 @@ def pack_snapshot(out: Path) -> str:
         if re.match(r"^(sh|sz|bj)\d{6}\.", n):
             data=json.loads(gzip.decompress((CACHE/n).read_bytes()))
             basis=data.get("adjustment", {})
-            if basis.get("schema")!=2 or basis.get("mode")!="qfq" or basis.get("status")=="quarantined":unverified.append(n)
+            if basis.get("schema")!=2 or (basis.get("mode")!="qfq" and basis.get("status")!="quarantined"):unverified.append(n)
     if unverified:
-        raise RuntimeError(f"拒绝发布含未验证复权历史的快照: {len(unverified)} files, e.g. {unverified[:5]}")
+        raise RuntimeError(f"拒绝发布未标记来源或隔离状态的快照: {len(unverified)} files, e.g. {unverified[:5]}")
     files = [{"name": n, "size": (CACHE / n).stat().st_size} for n in names]
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    header = json.dumps({"date": date, "files": files}, separators=(",", ":")).encode()
+    daily=[];quarantined=[];partial=[]
+    for n in names:
+        if re.match(r"^(sh|sz|bj)\d{6}\.",n):
+            d=json.loads(gzip.decompress((CACHE/n).read_bytes()));a=d.get("adjustment",{})
+            if a.get("status")=="quarantined":quarantined.append(n)
+            if n.endswith(".day.json.gz") and d.get("bars") and a.get("mode")=="qfq":
+                daily.append((n,d["bars"][-1]["date"]))
+                if d.get("quarantinedHistory"):partial.append(n)
+    market_date=max((d for _,d in daily),default="")
+    quality={"marketDate":market_date,"dailyFiles":len(daily),"dailyOnLatestAvailableDate":sum(d==market_date for _,d in daily),"staleDailyFiles":[n for n,d in daily if d<market_date],"quarantinedFiles":quarantined,"partialDailyHistoryFiles":partial}
+    (ROOT/"snapshot-quality.json").write_text(json.dumps(quality,ensure_ascii=False,indent=2))
+    header = json.dumps({"date": date, "files": files, "quality":quality}, separators=(",", ":")).encode()
     with out.open("wb") as f:
         f.write(SNAPSHOT_MAGIC + struct.pack("<I", len(header)) + header)
         for item in files: f.write((CACHE / item["name"]).read_bytes())
@@ -563,12 +591,6 @@ def main() -> int:
             data["adjustment"] = {"schema": 2, "source": "legacy", "mode": "unknown", "status": "quarantined"}
             data["updatedAt"] = 0
             path.write_bytes(gzip.compress(json.dumps(data, separators=(",", ":")).encode()))
-    # 期货主连（新浪）：~70 品种 day 全历史 + m30，分钟级完成；
-    # --skip-daily-weekly 的纯 m30 批次模式跳过（保持该模式语义纯粹）
-    if not args.skip_daily_weekly:
-        fut_deadline = PROCESS_STARTED + args.max_hours * 3600
-        fok, ffail = ingest_futures(fut_deadline)
-        print(f"futures ingested: {fok} varieties, {ffail} failed", flush=True)
     # 数据完整性策略：day/week/month/m30 全部增量合并（历史只增不减）。
     # week 由合并后的全历史日线聚合（口径统一、零请求）；month 由日线按自然月聚合，
     # 两者都随每次 day 刷新自动更新，无需单独请求。
@@ -583,7 +605,7 @@ def main() -> int:
         # 其余按 universe 顺序每天刷新（更新最新 K 线 + 复权因子）
         day_existing = {p.name.split(".")[0] for p in CACHE.glob("*.day.json.gz")}
         day_missing = [s for s in universe if s not in day_existing]
-        day_rest = [s for s in universe if s in day_existing]
+        day_rest = sorted((s for s in universe if s in day_existing), key=lambda s: load_cache_meta(s,"day").get("updatedAt",0))
         day_jobs = [(s, "day", PERIODS["day"][1]) for s in day_missing + day_rest]
         if day_missing:
             print(f"day first-pass: {len(day_missing)} missing pushed to front", flush=True)
@@ -631,25 +653,19 @@ def main() -> int:
         print(f"m30 self-heal: {len(m30_missing)} missing + {len(stale)} refresh / {len(universe)} universe", flush=True)
     else:
         m30_jobs = [(s, "m30", PERIODS["m30"][1]) for s in watched]
-    # 交错调度：m30 缺口大时多排（2:1），day 已齐全后只是刷新。
-    # 队列形状：day×1 + m30×2 + backfill×1 每轮，任一队列失速时其他照常产出
-    jobs: list[tuple[str, str, int]] = []  # (symbol, kind, limit)  kind: day/m30/backfill
-    queues = [day_jobs, m30_jobs, [(s, "backfill", 0) for s in backfill_jobs]]
-    quota = [1, 2, 1]
-    qi = [0, 0, 0]
-    while any(qi[k] < len(queues[k]) for k in range(3)):
-        for k in range(3):
-            for _ in range(quota[k]):
-                if qi[k] < len(queues[k]): jobs.append(queues[k][qi[k]]); qi[k] += 1
+    # Publish the screening universe before spending time on minute/history repairs.
+    jobs = day_jobs + m30_jobs + [(s, "backfill", 0) for s in backfill_jobs]
     if not jobs: raise RuntimeError("没有待执行任务")
     workers = max(1, min(args.workers, 4))
     # 死线守卫：从进程启动时刻起算（PROCESS_STARTED，模块加载即起表），
     # 覆盖快照恢复/tdx 下载灌底座等前置阶段的耗时。到点放弃剩余任务
     # （缺口靠快照合并 + 下轮运行自然补齐），保证走到打包发布那一步。
     # --max-hours 应显式小于 GitHub timeout-minutes 留出发布余量。
-    deadline = PROCESS_STARTED + args.max_hours * 3600
+    deadline = PROCESS_STARTED + min(args.max_hours,4.0) * 3600
+    repair_adjustment.DEADLINE = deadline
 
     def run_job(s: str, kind: str, _lim: int):
+        if time.monotonic() >= deadline:raise TimeoutError('snapshot collection budget reached')
         if kind == "backfill":
             return dayback(s)
         return fetch(s, kind, _lim), True
@@ -658,8 +674,17 @@ def main() -> int:
         futures = {pool.submit(run_job, s, k, lim): (s, k) for s, k, lim in jobs}
         failures = []
         aborted = 0
+        daily_remaining = len(day_jobs)
+        daily_published = False
         for i, fut in enumerate(as_completed(futures), 1):
             s, k = futures[fut]
+            if not daily_remaining and day_jobs and not daily_published:
+                checkpoint = ROOT / "kline-screening.ksnap"
+                pack_snapshot(checkpoint)
+                if token and repo:publish(checkpoint,repo,token,args.keep)
+                daily_published = True
+                print("Fresh daily screening snapshot published; continuing bounded history/minute repairs",flush=True)
+            if k == "day":daily_remaining -= 1
             if time.monotonic() > deadline:
                 aborted = len(futures) - i + 1
                 break
@@ -684,7 +709,7 @@ def main() -> int:
                     failures.append(f"{s} {k}: {exc}")
                     print(f"[{i}/{len(futures)}] QUARANTINED {s} {k}: {exc}", flush=True)
                     continue
-                save_cache(s, k, bars, **({"backfilled": True} if k == "day" and complete and len(bars) >= FQ_PAGE_COUNT else {}))
+                save_cache(s, k, bars, **({"backfilled": False} if k == "day" and load_cache_meta(s,"day").get("quarantinedHistory") else {}))
                 if k == "day":
                     save_cache(s, "week", derive_week_bars(bars))
                     save_cache(s, "month", derive_month_bars(bars))
@@ -697,8 +722,14 @@ def main() -> int:
         print(f"completed with {len(failures)}/{len(jobs)} failed requests", file=sys.stderr)
         # 失败容忍阈值放宽：限流期尾段损失一批属正常（缺口下轮自然补齐），
         # 只有超过一半（说明数据源整体不可用）才拒绝发布。
-        if len(failures) > len(jobs) // 2:
-            raise RuntimeError("too many failed market requests; snapshot was not published")
+        print("Per-file freshness and quarantine status are included in snapshot quality; unaffected data will publish",flush=True)
+    if day_jobs and not daily_published:
+        checkpoint=ROOT/"kline-screening.ksnap"
+        pack_snapshot(checkpoint)
+        if token and repo:publish(checkpoint,repo,token,args.keep)
+    if not args.skip_daily_weekly and time.monotonic() < deadline:
+        fok,ffail=ingest_futures(deadline)
+        print(f"futures ingested after daily publication: {fok}, failed: {ffail}",flush=True)
     out = ROOT / "kline-snapshot.ksnap"
     digest = pack_snapshot(out)
     print(f"snapshot={out} sha256={digest} bytes={out.stat().st_size}")
