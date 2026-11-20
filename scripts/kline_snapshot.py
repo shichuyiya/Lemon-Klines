@@ -409,7 +409,18 @@ def unpack_snapshot(raw: bytes) -> int:
             raise RuntimeError(f"unsafe snapshot filename: {name!r}")
         if not isinstance(size, int) or size < 0 or pos + size > len(raw):
             raise RuntimeError(f"invalid snapshot file size: {name}")
-        (CACHE / name).write_bytes(raw[pos:pos + size])
+        incoming=raw[pos:pos+size]
+        # A failed prior run may have newer verified files in the Actions recovery cache.
+        try:
+            existing=load_cache_meta(name.split('.')[0],name.split('.')[1])
+            new=json.loads(gzip.decompress(incoming))
+            basis=existing.get("adjustment",{})
+            if basis.get("schema")==2 and basis.get("mode")=="qfq" and basis.get("status")!="quarantined" and existing.get("updatedAt",0)>new.get("updatedAt",0) and existing.get("bars",[])[-1]["date"]>=new.get("bars",[])[-1]["date"]:
+                pos += size
+                count += 1
+                continue
+        except (ValueError,IndexError,KeyError,TypeError,OSError):pass
+        (CACHE / name).write_bytes(incoming)
         pos += size
         count += 1
     if pos != len(raw): raise RuntimeError("snapshot has trailing bytes")
@@ -468,15 +479,27 @@ def publish(snapshot: Path, repo: str, token: str, keep: int) -> None:
         release = json.loads(raw)
     else: raise RuntimeError(f"read release failed: HTTP {status} {raw[:300]!r}")
     name = f"kline-snapshot-{datetime.now(timezone.utc).strftime('%Y%m%d')}.ksnap"
-    for asset in release.get("assets", []):
-        if asset.get("name") == name: gh("DELETE", f"{base}/releases/assets/{asset['id']}", token)
-    upload = f"https://uploads.github.com/repos/{repo}/releases/{release['id']}/assets?name={urllib.parse.quote(name)}"
+    previous = next((a for a in release.get("assets",[]) if a.get("name")==name),None)
+    staging = f"{name}.upload-{time.time_ns()}"
+    upload = f"https://uploads.github.com/repos/{repo}/releases/{release['id']}/assets?name={urllib.parse.quote(staging)}"
     status, raw = gh("POST", upload, token, snapshot.read_bytes(), "application/octet-stream")
-    if status != 201: raise RuntimeError(f"upload failed: HTTP {status} {raw[:300]!r}")
+    if status != 201:raise RuntimeError(f"upload failed; previous snapshot retained: HTTP {status}")
+    staged=json.loads(raw)
+    if staged.get("size") != snapshot.stat().st_size:raise RuntimeError("uploaded snapshot size mismatch; previous snapshot retained")
+    if previous:
+        backup_name=f"{name}.previous-{time.time_ns()}"
+        status,raw=gh("PATCH",f"{base}/releases/assets/{previous['id']}",token,json.dumps({"name":backup_name}).encode())
+        if status!=200:raise RuntimeError("cannot stage previous snapshot; original retained")
+    status,raw=gh("PATCH",f"{base}/releases/assets/{staged['id']}",token,json.dumps({"name":name}).encode())
+    if status!=200:
+        if previous:gh("PATCH",f"{base}/releases/assets/{previous['id']}",token,json.dumps({"name":name}).encode())
+        raise RuntimeError("snapshot promotion failed; attempted to restore previous name")
+    # Only a completely uploaded, promoted version permits pruning the previous asset.
+    if previous:gh("DELETE",f"{base}/releases/assets/{previous['id']}",token)
     status, raw = gh("GET", f"{base}/releases/tags/kline-snapshot", token)
     if status == 200:
-        assets = sorted(json.loads(raw).get("assets", []), key=lambda a: a.get("name", ""), reverse=True)
-        for old in assets[keep:]: gh("DELETE", f"{base}/releases/assets/{old['id']}", token)
+        assets = sorted((a for a in json.loads(raw).get("assets", []) if re.fullmatch(r"kline-snapshot-\d{8}\.ksnap",a.get("name",""))),key=lambda a:a["name"],reverse=True)
+        for old in assets[keep:]:gh("DELETE",f"{base}/releases/assets/{old['id']}",token)
 
 
 def ingest_tdx_daily(*args, **kwargs):
@@ -678,6 +701,7 @@ def main() -> int:
         aborted = 0
         daily_remaining = len(day_jobs)
         daily_published = False
+        daily_fetched = 0
         for i, fut in enumerate(as_completed(futures), 1):
             s, k = futures[fut]
             if not daily_remaining and day_jobs and not daily_published:
@@ -711,6 +735,7 @@ def main() -> int:
                     failures.append(f"{s} {k}: {exc}")
                     print(f"[{i}/{len(futures)}] QUARANTINED {s} {k}: {exc}", flush=True)
                     continue
+                if k=="day":daily_fetched += 1
                 save_cache(s, k, bars, **({"backfilled": False} if k == "day" and load_cache_meta(s,"day").get("quarantinedHistory") else {}))
                 if k == "day":
                     save_cache(s, "week", derive_week_bars(bars))
@@ -737,6 +762,7 @@ def main() -> int:
     print(f"snapshot={out} sha256={digest} bytes={out.stat().st_size}")
     if token and repo: publish(out, repo, token, args.keep)
     else: print("GITHUB_TOKEN/SNAPSHOT_REPO not set; snapshot built locally only")
+    if day_jobs and not daily_fetched:raise RuntimeError("No daily refresh succeeded; previous usable data retained and published; retry required")
     return 0
 
 

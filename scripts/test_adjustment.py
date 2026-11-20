@@ -1,4 +1,4 @@
-import tempfile,unittest
+import tempfile,unittest,json,gzip
 from pathlib import Path
 from unittest.mock import patch
 import repair_adjustment as repair
@@ -50,4 +50,42 @@ class AdjustmentTests(unittest.TestCase):
         self.assertEqual(repair.transform(r,q,.025),(1.0,-1.0399999999999991))
         minute=bar('2026-07-28 09:30',30,30,30,30)
         self.assertTrue(repair.session_matches([minute],q,'m1',.0025))
+    def test_failed_upload_does_not_delete_previous_snapshot(self):
+        calls=[]
+        name='kline-snapshot-'+snapshot.datetime.now(snapshot.timezone.utc).strftime('%Y%m%d')+'.ksnap'
+        def fake(method,url,token,body=None,*args):
+            calls.append((method,url))
+            if method=='GET':return 200,json.dumps({'id':1,'assets':[{'id':9,'name':name}]}).encode()
+            return 503,b'unavailable'
+        with tempfile.TemporaryDirectory() as d,patch.object(snapshot,'gh',side_effect=fake):
+            p=Path(d)/'data.ksnap';p.write_bytes(b'x')
+            with self.assertRaises(RuntimeError):snapshot.publish(p,'owner/repo','test',7)
+        self.assertFalse(any(m in ('DELETE','PATCH') for m,_ in calls))
+    def test_failed_promotion_restores_previous_name(self):
+        calls=[]
+        name='kline-snapshot-'+snapshot.datetime.now(snapshot.timezone.utc).strftime('%Y%m%d')+'.ksnap'
+        def fake(method,url,token,body=None,*args):
+            calls.append((method,url,body))
+            if method=='GET':return 200,json.dumps({'id':1,'assets':[{'id':9,'name':name}]}).encode()
+            if method=='POST':return 201,json.dumps({'id':10,'size':1}).encode()
+            if url.endswith('/10'):return 503,b'unavailable'
+            return 200,b'{}'
+        with tempfile.TemporaryDirectory() as d,patch.object(snapshot,'gh',side_effect=fake):
+            p=Path(d)/'data.ksnap';p.write_bytes(b'x')
+            with self.assertRaises(RuntimeError):snapshot.publish(p,'owner/repo','test',7)
+        self.assertFalse(any(m=='DELETE' for m,_,_ in calls))
+        self.assertEqual(json.loads(calls[-1][2])['name'],name)
+    def test_resume_with_null_archive_and_quarantined_minutes(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache=Path(d)/'cache';backup=Path(d)/'backup';cache.mkdir();backup.mkdir()
+            basis={'schema':2,'source':'eastmoney','mode':'qfq'}
+            daily=[bar('2026-08-14')]
+            old={'bars':daily,'adjustment':basis,'quarantinedHistory':None}
+            (cache/'sh600641.day.json.gz').write_bytes(gzip.compress(json.dumps(old).encode()))
+            minute={'bars':[bar('2026-08-14 15:00')],'adjustment':{'schema':2,'mode':'unknown','status':'quarantined'}}
+            (cache/'sh600641.m30.json.gz').write_bytes(gzip.compress(json.dumps(minute).encode()))
+            with patch.object(repair,'full_daily',return_value=daily),patch.object(repair,'raw_daily',return_value=daily),patch.object(repair,'request',return_value=[]):
+                result=repair.repair_symbol('sh600641',cache,backup)
+            self.assertEqual(result['dailyBars'],1)
+            self.assertTrue((backup/'sh600641.m30.json.gz').exists())
 if __name__=='__main__':unittest.main()

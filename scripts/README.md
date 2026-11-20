@@ -29,3 +29,7 @@
 近期已验证日线可先发布供筛选，旧历史另存 `quarantinedHistory`，逐步完整重建；新鲜度、历史覆盖和隔离数量写入快照 quality 与工作流 artifact。
 修复报告及原始快照保留在 workflow artifact，未验证数据不会被静默裁掉。
 本地也可运行 `python3 scripts/repair_adjustment.py --cache PATH --backup BACKUP --report REPORT.json --workers 4`。
+
+失败恢复：Actions 缓存已完成的校验数据；恢复 Release 时不覆盖缓存中更新的已验证文件。
+发布先上传暂存资产，验证大小后再切换正式名称；切换失败尝试恢复旧名称，成功之前不删除旧资产。
+`Retry failed snapshot once` 仅对 main 分支首次失败自动重试一次，避免永久循环。质量报告和日志保留为工作流 artifact。
