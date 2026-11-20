@@ -12,8 +12,15 @@ jobs:
     timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
+      - name: Restore completed progress from prior runs
+        uses: actions/cache/restore@v4
+        with:
+          path: .kline-cache
+          key: kline-progress-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            kline-progress-
       - name: Test adjustment validation
-        run: python3 -m unittest discover -s scripts -p 'test_adjustment.py'
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Restore and preserve original snapshot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -86,3 +93,10 @@ jobs:
             snapshot-quality.json
             original/*.ksnap
           retention-days: 30
+
+      - name: Save completed progress even if publication fails
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .kline-cache
+          key: kline-progress-${{ github.run_id }}-${{ github.run_attempt }}

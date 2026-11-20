@@ -1,0 +1,19 @@
+name: Retry failed snapshot once
+on:
+  workflow_run:
+    workflows: ['K-line snapshot', 'Repair price adjustment']
+    types: [completed]
+permissions:
+  actions: write
+  contents: read
+jobs:
+  retry:
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retry failed jobs once
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh run rerun "$SNAPSHOT_RUN_ID" --failed --repo "$GITHUB_REPOSITORY"
