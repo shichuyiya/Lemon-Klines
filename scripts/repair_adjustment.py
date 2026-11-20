@@ -7,6 +7,9 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 SCHEMA=2
+DEADLINE=0.0
+EM_DISABLED_UNTIL=0.0
+EM_LOCK=threading.Lock()
 FIELDS=('open','high','low','close')
 KLT={'day':101,'week':102,'month':103,'m60':60,'m30':30,'m15':15,'m5':5,'m1':1}
 
@@ -14,15 +17,19 @@ def valid(b):
     return (all(isinstance(b.get(k),(int,float)) and math.isfinite(b[k]) for k in FIELDS)
             and b['low']<=min(b['open'],b['close'])<=max(b['open'],b['close'])<=b['high'])
 
-def request(symbol,tf='day',fqt=1):
+def request(symbol,tf='day',fqt=1,limit=10000):
+    global EM_DISABLED_UNTIL
+    with EM_LOCK:
+        if time.monotonic()<EM_DISABLED_UNTIL:raise ConnectionError('Eastmoney temporarily unavailable; use alternate provider')
     secid=('1.' if symbol.startswith('sh') else '0.')+symbol[2:]
-    url=(f'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&klt={KLT[tf]}&fqt={fqt}&lmt=10000'
+    url=(f'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&klt={KLT[tf]}&fqt={fqt}&lmt={limit}'
          '&end=20500101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57')
     time.sleep(.15)
     error=None
-    for attempt in range(3):
+    for attempt in range(2):
+        if DEADLINE and time.monotonic()>=DEADLINE:raise TimeoutError('repair budget reached')
         try:
-            response=subprocess.run(['curl','-fsSL','--max-time','15','-A','Mozilla/5.0','-e','https://quote.eastmoney.com/',url],capture_output=True,text=True,timeout=20,check=True)
+            response=subprocess.run(['curl','-fsSL','--max-time','8','-A','Mozilla/5.0','-e','https://quote.eastmoney.com/',url],capture_output=True,text=True,timeout=20,check=True)
             data=json.loads(response.stdout)
             lines=(data.get('data') or {}).get('klines') or []
             bars=[]
@@ -33,13 +40,18 @@ def request(symbol,tf='day',fqt=1):
             if not bars:raise ValueError('empty response')
             if len({b['date'] for b in bars})!=len(bars):raise ValueError('duplicate dates')
             return sorted(bars,key=lambda b:b['date'])
-        except Exception as e:error=e;time.sleep(.5*(attempt+1))
+        except Exception as e:
+            error=e
+            if attempt==1 and isinstance(e,(subprocess.SubprocessError,OSError,json.JSONDecodeError)):
+                with EM_LOCK:EM_DISABLED_UNTIL=time.monotonic()+600
+            time.sleep(.5*(attempt+1))
     raise RuntimeError(f'{symbol} {tf}: {error}')
 
 def tencent_full(symbol, adjusted=True):
     """Single-provider full history; Tencent fallback pages overlap and must agree."""
     all_bars={};end='';oldest=None
     for page_no in range(80):
+        if DEADLINE and time.monotonic()>=DEADLINE:raise TimeoutError('repair pagination budget reached')
         url=f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,{end},640,{"qfq" if adjusted else ""}'
         response=subprocess.run(['curl','-fsSL','--retry','2','--max-time','15',url],capture_output=True,text=True,timeout=60,check=True)
         node=(json.loads(response.stdout).get('data') or {}).get(symbol) or {}
@@ -142,10 +154,10 @@ def write(path,payload,backup):
 
 def repair_symbol(symbol,cache,backup):
     files=sorted(cache.glob(symbol+'.*.json.gz'));old={p.name.split('.')[1]:read(p) for p in files}
-    if old.get('day',{}).get('adjustment',{}).get('schema')==SCHEMA and all(v.get('adjustment',{}).get('mode')=='qfq' and v.get('adjustment',{}).get('status')!='quarantined' for v in old.values()):
+    if old.get('day',{}).get('adjustment',{}).get('schema')==SCHEMA and not old['day'].get('quarantinedHistory') and all(v.get('adjustment',{}).get('mode')=='qfq' and v.get('adjustment',{}).get('status')!='quarantined' for v in old.values()):
         return {'symbol':symbol,'status':'already-verified'}
     daily=full_daily(symbol)
-    previous=old.get('day',{}).get('bars',[])
+    previous=old.get('day',{}).get('quarantinedHistory',old.get('day',{})).get('bars',[])
     if previous and not {b['date'] for b in previous}<={b['date'] for b in daily}:
         alternate=tencent_full(symbol)
         if not {b['date'] for b in previous}<={b['date'] for b in alternate}:raise ValueError('full providers do not cover every legacy date; refusing replacement')
@@ -175,14 +187,21 @@ def repair_symbol(symbol,cache,backup):
     return result
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--cache',type=Path,required=True);p.add_argument('--backup',type=Path,required=True);p.add_argument('--symbols',nargs='*');p.add_argument('--workers',type=int,default=2);p.add_argument('--report',type=Path,required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--cache',type=Path,required=True);p.add_argument('--backup',type=Path,required=True);p.add_argument('--symbols',nargs='*');p.add_argument('--workers',type=int,default=2);p.add_argument('--report',type=Path,required=True);p.add_argument('--max-seconds',type=float,default=0);a=p.parse_args()
     a.backup.mkdir(parents=True,exist_ok=True);a.report.parent.mkdir(parents=True,exist_ok=True)
     symbols=a.symbols or sorted({f.name.split('.')[0] for f in a.cache.glob('*.json.gz') if __import__('re').match(r'^(sh|sz|bj)\d{6}\.',f.name)})
     # Resume completed verified symbols, but keep quarantined minute histories in the report.
     results=[]
+    started=time.monotonic()
+    global DEADLINE
+    DEADLINE=started+a.max_seconds if a.max_seconds else 0.0
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as pool:
         futures={pool.submit(repair_symbol,s,a.cache,a.backup):s for s in symbols}
         for f in concurrent.futures.as_completed(futures):
+            if a.max_seconds and time.monotonic()-started>a.max_seconds:
+                for queued in futures:queued.cancel()
+                print('Repair window ended; remaining symbols will resume next run',flush=True)
+                break
             s=futures[f]
             try:r=f.result()
             except Exception as e:r={'symbol':s,'error':str(e)}

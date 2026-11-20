@@ -9,7 +9,7 @@ concurrency:
 jobs:
   repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
       - name: Test adjustment validation
@@ -31,7 +31,7 @@ jobs:
           PY
       - name: Rebuild and validate every equity and ETF history
         run: |
-          python3 scripts/repair_adjustment.py --cache .kline-cache --backup .adjustment-backup --workers 4 --report repair-report.json
+          python3 scripts/repair_adjustment.py --cache .kline-cache --backup .adjustment-backup --workers 4 --max-seconds 5400 --report repair-report.json
       - name: Summarize repair
         if: always()
         run: |
@@ -44,7 +44,7 @@ jobs:
               with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
                   f.write(f"Processed {len(rows)} symbols; failed {len(errors)}. See adjustment-audit artifact for full evidence.\n")
           PY
-      - name: Validate completeness before publishing
+      - name: Classify remaining histories without blocking fresh data
         run: |
           python3 - <<'PY'
           import gzip,json,re
@@ -53,9 +53,13 @@ jobs:
           for p in Path('.kline-cache').glob('*.json.gz'):
               if not re.match(r'^(sh|sz|bj)\d{6}\.',p.name): continue
               d=json.loads(gzip.decompress(p.read_bytes()));a=d.get('adjustment',{})
-              if a.get('schema')!=2 or a.get('mode')!='qfq' or a.get('status')=='quarantined':failures.append(p.name)
+              if a.get('schema')!=2 or a.get('mode')!='qfq' or a.get('status')=='quarantined':
+                  failures.append(p.name)
+                  d['adjustment']={'schema':2,'source':'legacy','mode':'unknown','status':'quarantined'}
+                  d['updatedAt']=0
+                  p.write_bytes(gzip.compress(json.dumps(d,separators=(',',':')).encode()))
           Path('unverified-files.json').write_text(json.dumps(failures,indent=2))
-          if failures:raise SystemExit(f'Refusing publish: {len(failures)} histories still unverified; see artifacts')
+          print(f'{len(failures)} histories isolated; verified updates will still publish')
           PY
       - name: Pack repaired snapshot
         run: |
@@ -79,5 +83,6 @@ jobs:
           path: |
             repair-report.json
             unverified-files.json
+            snapshot-quality.json
             original/*.ksnap
           retention-days: 30

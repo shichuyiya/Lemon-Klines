@@ -25,5 +25,7 @@
 
 手动运行 **Repair price adjustment** 工作流：恢复原始快照，完整重建所有股票和 ETF，按同日日线核对分钟历史。
 分钟转换仅用于能用原始日线的价格范围、开收盘锚点验证的交易日；其余历史保留原件并隔离。
-所有文件通过口径检查才发布；失败报告和修复前快照保留在工作流 artifact，未验证数据不会被静默裁掉。
+日常 GitHub Actions 保留定时运行，先发布最新日线供筛选，再执行分钟和历史补修。异常文件单独隔离，绝不阻塞正常数据发布。
+近期已验证日线可先发布供筛选，旧历史另存 `quarantinedHistory`，逐步完整重建；新鲜度、历史覆盖和隔离数量写入快照 quality 与工作流 artifact。
+修复报告及原始快照保留在 workflow artifact，未验证数据不会被静默裁掉。
 本地也可运行 `python3 scripts/repair_adjustment.py --cache PATH --backup BACKUP --report REPORT.json --workers 4`。
