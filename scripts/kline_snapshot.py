@@ -162,7 +162,8 @@ def fetch(symbol: str, period: str, limit: int) -> list[dict]:
                f"param={symbol},m30,,,{limit}")
     else:
         kind = {"day": "day", "week": "week", "month": "month"}[period]
-        end = f",{END_ANCHOR[symbol]}" if symbol in END_ANCHOR else ""
+        anchor = END_ANCHOR.get(symbol) or ""
+        end = f",{anchor}" if anchor else ""
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
                f"param={symbol},{kind},{end},,{limit},qfq")
     data = http_json(url).get("data") or {}
@@ -234,6 +235,13 @@ def merge_bars(symbol: str, period: str, fresh: list[dict]) -> list[dict]:
 
 # 兼容旧名
 merge_m30_bars = lambda symbol, fresh: merge_bars(symbol, "m30", fresh)
+
+
+def is_etf_symbol(symbol: str) -> bool:
+    """ETF/LOF 识别：沪 5 开头（51x/56x/58x/50x）、深 15 开头。
+    这些品种走纯腾讯 qfq 路径（全序列折算），不进官网包底座（原始价口径）。"""
+    code = symbol[2:]
+    return symbol.startswith("sh") and code[:1] == "5" or symbol.startswith("sz") and code[:2] == "15"
 
 
 def dayback(symbol: str) -> tuple[list[dict], bool]:
@@ -433,16 +441,22 @@ def publish(snapshot: Path, repo: str, token: str, keep: int) -> None:
 def ingest_tdx_daily(universe: list[str], cache_dir: Path | None = None) -> tuple[int, int]:
     """通达信官网日线包灌底座：全历史原始价 + 锚定比值前复权。
 
-    对 universe 中每只股票：
+    对 universe 中每只**股票**（ETF 除外，见 is_etf_symbol）：
     - 官网 .day 原始全历史为骨架（QFQ_COVER 覆盖区内已有腾讯 qfq 的除外）
     - 快照里已有的腾讯 qfq 日线（最近 ~640 根，天然前复权）优先级更高——
       重叠区直接采用；更早历史 × (重叠首日 qfq收/原始收) 比值
     - 结果与快照旧文件 merge 后落盘，全历史只增不减
+
+    ETF/LOF 必须绕过官网包底座：官网 .day 是原始价口径（基金份额拆分/分红
+    未折算，实测 588710 拆分日 C=31.6→11.14 断崖），而锚定比值法只有"最近
+    一次事件"的因子，会留下未修正的旧事件跳变。ETF 走纯腾讯 qfq 路径
+    （qfq 全序列折算，上市初 0.333 与现价连续，与通达信/同花顺展示一致）。
     返回 (灌入股票数, 新增 bar 总数)。
     """
+    stock_universe = [s for s in universe if not is_etf_symbol(s)]
     zips: dict[str, Path] = {}
     for mkt in ("sh", "sz", "bj"):
-        syms = [s for s in universe if s.startswith(mkt)]
+        syms = [s for s in stock_universe if s.startswith(mkt)]
         if not syms: continue
         dest = (cache_dir / f"{mkt}lday.zip") if cache_dir else ROOT / f".tdx-{mkt}lday.zip"
         try:
@@ -623,16 +637,20 @@ def main() -> int:
     if args.backfill_days > 0 and restored:
         # 选股：优先回填最早日线离今天最远的股票（老股先回填）。
         # 已触底（backfilled=true）的跳过；没有 day 文件的靠日常 day 任务先建档。
+        # ETF/LOF 优先级置顶：官网包底座不覆盖 ETF（原始价口径弃用），
+        # 全历史必须靠 qfq 翻页回填（dayback），62 只 ETF 每只 1-2 页即可触底。
         scored: list[tuple[str, str]] = []
         for s in universe:
             meta = load_cache_meta(s, "day")
             bars = meta.get("bars") or []
             if not bars or meta.get("backfilled"):
                 continue
-            scored.append((bars[0]["date"], s))  # bars 已按时间排序
+            key = ("0", s) if is_etf_symbol(s) else ("1", bars[0]["date"] + s)
+            scored.append((key, s))  # ETF key 最小 → 排最前
         scored.sort()
-        backfill_jobs = [s for _, s in scored[:args.backfill_days]]
-        print(f"day backfill: {len(backfill_jobs)} stocks (oldest first), "
+        backfill_jobs = [s for _, s in scored[:max(args.backfill_days, len([1 for k, _ in scored if k[0] == "0"]))]]
+        etf_pending = len([1 for k, _ in scored if k[0] == "0"])
+        print(f"day backfill: {len(backfill_jobs)} stocks (ETF 优先 {min(etf_pending, len(backfill_jobs))} 只), "
               f"pending total {len(scored)}", flush=True)
     if args.all_m30:
         start = args.batch_index * args.batch_size
